@@ -1,0 +1,6 @@
+streamlit
+requests
+Pillow
+moviepy
+edge-tts
+imageio-ffmpeg
