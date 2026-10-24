@@ -377,4 +377,18 @@ script = st.text_area(
     placeholder="यहाँ अपनी पूरी कहानी या वीडियो की स्क्रिप्ट डालें..."
 )
 
-video_format =
+video_format = st.selectbox(
+    "📐 वीडियो का आकार चुनें",
+    [
+        "YouTube Shorts (9:16)",
+        "Landscape (16:9)",
+        "Square (1:1)"
+    ]
+)
+
+voice_label = st.selectbox(
+    "🎙️ हिंदी आवाज़ चुनें",
+    list(VOICES.keys())
+)
+
+voice = VOICES[voice_label]
