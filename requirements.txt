@@ -1,5 +1,7 @@
 streamlit
 requests
-Pillow
+pillow
 edge-tts
 imageio-ffmpeg
+deep-translator
+ddgs
