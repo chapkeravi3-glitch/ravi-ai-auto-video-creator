@@ -4,6 +4,7 @@ import subprocess
 import tempfile
 import os
 import re
+import json
 import asyncio
 import random
 import io
@@ -44,7 +45,7 @@ st.set_page_config(
 )
 
 st.title("🎬 Ravi AI Auto Video Creator")
-st.write("सिर्फ़ हिंदी कहानी डालें। तस्वीरें अपने आप खोजकर एनिमेशन वाला वीडियो बन जाएगा।")
+st.write("सिर्फ़ हिंदी कहानी डालें। कहानी के हिसाब से तस्वीरें चुनकर एनिमेशन वाला वीडियो बनेगा।")
 
 VOICES = {
     "हिंदी पुरुष": "hi-IN-MadhurNeural",
@@ -62,7 +63,9 @@ EFFECTS = ["Zoom In", "Zoom Out", "Pan Left to Right", "Pan Right to Left"]
 FPS = 24
 PAD = 0.4
 FADE = 0.3
-HEADERS = {"User-Agent": "RaviAIVideoCreator/3.0 (personal video project)"}
+# मुफ़्त स्तर वाले मॉडल, क्रम से आज़माए जाते हैं (नाम बदल सकते हैं)
+GEMINI_MODELS = ["gemini-3.5-flash", "gemini-3.5-flash-lite", "gemini-3-flash-preview"]
+HEADERS = {"User-Agent": "RaviAIVideoCreator/4.0 (personal video project)"}
 
 # ---------------------------------------------------------------- इनपुट
 script = st.text_area("📝 पूरी हिंदी कहानी लिखें", height=280)
@@ -78,23 +81,28 @@ with col2:
     )
     max_chars = st.slider(
         "✂️ एक दृश्य में अधिकतम अक्षर (कम = तस्वीरें जल्दी-जल्दी बदलेंगी)",
-        60, 400, 120, 10
+        60, 400, 140, 10
     )
 
 use_web = st.checkbox(
-    "🌐 इंटरनेट की किसी भी तस्वीर से खोजें (ताज़ा और असली फ़ोटो मिलती हैं; "
-    "इनका कॉपीराइट आपकी ज़िम्मेदारी है)",
+    "🌐 इंटरनेट की तस्वीरों में खोजें (कॉपीराइट आपकी ज़िम्मेदारी है)",
     value=True
 )
 use_ai = st.checkbox(
-    "🤖 तस्वीर न मिले तो AI से बनाएँ",
+    "🤖 मेल खाती तस्वीर न मिले तो AI से बनाएँ (बेमेल तस्वीर लगाने से यह बेहतर है)",
     value=True
 )
 
-with st.expander("और सटीक तस्वीरों के लिए (वैकल्पिक)"):
+st.markdown("**सबसे सटीक तस्वीरों के लिए:**")
+gemini_key = st.text_input(
+    "Google Gemini API key (मुफ़्त; aistudio.google.com से मिलती है; सबसे सटीक तस्वीरों के लिए सुझाई जाती है)",
+    type="password"
+)
+
+with st.expander("और विकल्प (वैकल्पिक)"):
     extra_topic = st.text_input(
-        "कहानी का विषय English में",
-        placeholder="India cricket team 2026 match"
+        "कहानी का मुख्य विषय English में (हर खोज में जुड़ेगा)",
+        placeholder="Babylon"
     )
     pixabay_key = st.text_input("Pixabay API key (मुफ़्त)", type="password")
 
@@ -143,6 +151,10 @@ such only just said says like what who whom whose why how all each every both fe
 one two three four five six seven eight nine ten again once here those these its itself
 """.split())
 
+GENERIC = set(
+    "ancient city people photo image picture view history historical old world great".split()
+)
+
 
 def translate_hi_en(text, limit=1500):
     if GoogleTranslator is None or not text.strip():
@@ -166,8 +178,104 @@ def english_keywords(text):
     return keep
 
 
+def parse_json(text):
+    text = re.sub(r"```(?:json)?", "", text).strip()
+    try:
+        return json.loads(text)
+    except Exception:
+        m = re.search(r"\{.*\}", text, re.S)
+        if m:
+            try:
+                return json.loads(m.group(0))
+            except Exception:
+                return None
+    return None
+
+
+def plan_with_ai(scenes, opening, key, on_progress=None):
+    """हर दृश्य के लिए तस्वीर की खोज और AI prompt, मुफ़्त Gemini से।"""
+    anchor = ""
+    plans = [None] * len(scenes)
+    last_error = ""
+    CH = 15
+
+    for start in range(0, len(scenes), CH):
+        chunk = scenes[start:start + CH]
+        numbered = "\n".join(
+            f"{start + j + 1}. {s[:300]}" for j, s in enumerate(chunk)
+        )
+        prompt = (
+            "You choose real photographs for a Hindi documentary-style video.\n"
+            f"Story opening (Hindi): {opening[:700]}\n\n"
+            "Scenes (Hindi), numbered:\n"
+            f"{numbered}\n\n"
+            "For EACH scene return:\n"
+            '- "query": an English image-search query of 2 to 5 words for a REAL '
+            "photograph, museum object, ruin, map or painting that visually matches "
+            "what is being said. Always include the specific subject name "
+            "(place, person, object) - never only generic words.\n"
+            '- "ai": a detailed English prompt (one sentence) describing the '
+            "visual, to generate an image if no photo is found. No text in the "
+            "image, no real living people.\n"
+            'Also return "anchor": the one or two word main subject of the whole story.\n'
+            "Respond with ONLY JSON, no markdown: "
+            '{"anchor":"...","scenes":[{"n":1,"query":"...","ai":"..."}]}'
+        )
+
+        data = None
+        for attempt in range(2):
+            try:
+                text = ""
+                for model in GEMINI_MODELS:
+                    r = requests.post(
+                        "https://generativelanguage.googleapis.com/v1beta/"
+                        f"models/{model}:generateContent",
+                        headers={
+                            "x-goog-api-key": key,
+                            "Content-Type": "application/json",
+                        },
+                        json={
+                            "contents": [{"parts": [{"text": prompt}]}],
+                            "generationConfig": {
+                                "responseMimeType": "application/json"
+                            },
+                        },
+                        timeout=90,
+                    )
+                    if r.status_code == 200:
+                        parts = r.json()["candidates"][0]["content"]["parts"]
+                        text = "".join(p.get("text", "") for p in parts)
+                        break
+                    last_error = f"{model} {r.status_code}: {r.text[:150]}"
+                    if r.status_code == 429:
+                        time.sleep(6)
+                data = parse_json(text)
+                if data:
+                    break
+            except Exception as e:
+                last_error = str(e)[:200]
+
+        if on_progress:
+            on_progress(min(start + CH, len(scenes)))
+        time.sleep(1)
+
+        if not data:
+            continue
+
+        anchor = anchor or str(data.get("anchor", "")).strip()
+        for item in data.get("scenes", []):
+            try:
+                n = int(item.get("n")) - 1
+            except Exception:
+                continue
+            if 0 <= n < len(scenes):
+                plans[n] = item
+
+    return anchor, plans, last_error
+
+
 def llm_query(scene, topic):
-    """मुफ़्त text सेवा से दृश्य के लिए तस्वीर-खोज का शब्द माँगता है।"""
+    """Gemini key न हो तो मुफ़्त text सेवा से कोशिश।"""
     prompt = (
         "You pick real photographs for a Hindi story video. "
         f"Story topic: {topic[:300]}. "
@@ -195,25 +303,26 @@ def llm_query(scene, topic):
         return None
 
 
-def scene_queries(scene, topic, topic_short):
+def with_anchor(query, anchor):
+    if anchor and anchor.lower() not in query.lower():
+        return f"{anchor} {query}"
+    return query
+
+
+def scene_queries(scene, topic, anchor):
     queries = []
 
     q = llm_query(scene, topic)
     if q:
-        queries.append(q)
+        queries.append(with_anchor(q, anchor))
 
     english = translate_hi_en(scene)
     kws = english_keywords(english)
     if kws:
-        q2 = " ".join(kws[:4])
-        if topic_short:
-            q2 = f"{q2} {topic_short.split()[0]}"
-        queries.append(q2)
+        queries.append(with_anchor(" ".join(kws[:3]), anchor))
 
-    if topic_short:
-        queries.append(topic_short)
-
-    queries.append(" ".join(scene.split()[:5]))
+    if anchor:
+        queries.append(anchor)
 
     seen, final = set(), []
     for q in queries:
@@ -223,7 +332,25 @@ def scene_queries(scene, topic, topic_short):
     return final, english
 
 
+# ---------------------------------------------------------------- मेल की जाँच
+def match_words(query, anchor):
+    words = re.findall(r"[a-z]+", f"{query} {anchor}".lower())
+    strict = {
+        w for w in words
+        if len(w) >= 4 and w not in STOPWORDS and w not in GENERIC
+    }
+    if strict:
+        return strict
+    return {w for w in words if len(w) >= 4 and w not in STOPWORDS}
+
+
+def score_text(text, words):
+    t = (text or "").lower()
+    return sum(1 for w in words if w in t)
+
+
 # ---------------------------------------------------------------- तस्वीर के स्रोत
+# हर स्रोत (url, शीर्षक/टैग) की सूची देता है, ताकि मेल जाँचा जा सके।
 def pixabay_urls(query, key):
     lang = "hi" if re.search(r"[\u0900-\u097F]", query) else "en"
     try:
@@ -241,8 +368,11 @@ def pixabay_urls(query, key):
             timeout=25,
         )
         r.raise_for_status()
-        hits = r.json().get("hits", [])
-        return [h.get("largeImageURL") or h.get("webformatURL") for h in hits]
+        out = []
+        for h in r.json().get("hits", []):
+            url = h.get("largeImageURL") or h.get("webformatURL")
+            out.append((url, h.get("tags", "")))
+        return out
     except Exception:
         return []
 
@@ -252,8 +382,8 @@ def web_urls(query):
         return []
     try:
         with DDGS() as d:
-            results = list(d.images(query, max_results=20))
-        return [r.get("image") for r in results]
+            results = list(d.images(query, max_results=25))
+        return [(r.get("image"), r.get("title", "")) for r in results]
     except Exception:
         return []
 
@@ -267,20 +397,31 @@ def openverse_urls(query):
             timeout=25,
         )
         r.raise_for_status()
-        urls = []
+        out = []
         for item in r.json().get("results", []):
-            urls.append(item.get("url"))
-            urls.append(item.get("thumbnail"))
-        return urls
+            tags = " ".join(t.get("name", "") for t in item.get("tags", []) or [])
+            text = f"{item.get('title', '')} {tags}"
+            out.append((item.get("url"), text))
+            out.append((item.get("thumbnail"), text))
+        return out
     except Exception:
         return []
 
 
-def try_download(urls, save_path, used, max_tries=8):
-    tries = 0
-    for url in urls:
+def try_download(cands, save_path, used, words, max_tries=8):
+    scored = []
+    for url, text in cands:
         if not url or url in used:
             continue
+        s = score_text(text, words) if words else 0
+        if words and s < 1:
+            continue  # शीर्षक/टैग में कुछ भी मेल नहीं खाता, छोड़ दें
+        scored.append((s, url))
+
+    scored.sort(key=lambda x: -x[0])
+
+    tries = 0
+    for _, url in scored:
         if tries >= max_tries:
             break
         tries += 1
@@ -301,8 +442,9 @@ def try_download(urls, save_path, used, max_tries=8):
     return False
 
 
-def find_photo(queries, save_path, used, key, web_on):
+def find_photo(queries, save_path, used, key, web_on, anchor):
     for q in queries:
+        words = match_words(q, anchor)
         sources = []
         if key:
             sources.append(("Pixabay", lambda q=q: pixabay_urls(q, key)))
@@ -311,13 +453,12 @@ def find_photo(queries, save_path, used, key, web_on):
         sources.append(("Openverse", lambda q=q: openverse_urls(q)))
 
         for name, fetch in sources:
-            if try_download(fetch(), save_path, used):
+            if try_download(fetch(), save_path, used, words):
                 return name, q
     return None, None
 
 
 def ai_image(prompt, save_path, size):
-    """Pollinations से तस्वीर बनवाता है (बिना key)।"""
     if not prompt.strip():
         return False
 
@@ -426,7 +567,6 @@ def make_clip(image, audio, out, size, effect, ffmpeg):
     bw, bh = w * 3 // 2, h * 3 // 2
     fade_out_start = max(0.0, total - FADE)
 
-    # CapCut जैसा: धुंधली पृष्ठभूमि + बीच में पूरी तस्वीर, फिर zoom/pan और fade
     fc = (
         "[0:v]split[a][b];"
         f"[a]scale={bw}:{bh}:force_original_aspect_ratio=increase,"
@@ -520,13 +660,27 @@ if st.button("🎬 वीडियो बनाना शुरू करें"
             )
         )
 
-        # 2) कहानी का विषय (तस्वीरों को सही दिशा देने के लिए)
-        status.info("कहानी का विषय समझा जा रहा है...")
-        if extra_topic.strip():
-            topic = extra_topic.strip()
-        else:
-            topic = translate_hi_en(script, 600) or script[:200]
-        topic_short = " ".join(english_keywords(topic)[:4])
+        # 2) विषय और हर दृश्य की तस्वीर-योजना
+        status.info("कहानी का विषय और हर दृश्य की योजना बन रही है...")
+        topic = extra_topic.strip() or translate_hi_en(script, 600) or script[:200]
+
+        anchor = extra_topic.strip()
+        plans = [None] * total_scenes
+
+        if gemini_key.strip():
+            c_anchor, plans, err = plan_with_ai(
+                scenes, script, gemini_key.strip()
+            )
+            if not any(plans):
+                st.warning(
+                    "Gemini से योजना नहीं बन सकी, सामान्य तरीका इस्तेमाल होगा। "
+                    f"कारण: {err}"
+                )
+            anchor = anchor or c_anchor
+
+        if not anchor:
+            kws = english_keywords(topic)
+            anchor = kws[0] if kws else ""
 
         # 3) हर दृश्य की तस्वीर
         uploads = []
@@ -547,21 +701,35 @@ if st.button("🎬 वीडियो बनाना शुरू करें"
             source, query = None, ""
 
             if i < len(uploads):
-                images.append(uploads[i])
-                last_good = uploads[i]
-                source, query = "आपकी तस्वीर", ""
                 shutil.copy(uploads[i], path)
+                images.append(path)
+                last_good = path
+                source = "आपकी तस्वीर"
             else:
-                queries, english = scene_queries(scene, topic, topic_short)
+                plan = plans[i]
+                english = ""
+
+                if plan and plan.get("query"):
+                    q = str(plan["query"]).strip()
+                    queries = [with_anchor(q, anchor)]
+                    if anchor:
+                        queries.append(anchor)
+                else:
+                    queries, english = scene_queries(scene, topic, anchor)
+
                 source, query = find_photo(
-                    queries, path, used_urls, pixabay_key.strip(), use_web
+                    queries, path, used_urls, pixabay_key.strip(), use_web, anchor
                 )
 
                 if not source and use_ai:
                     status.info(
-                        f"तस्वीर नहीं मिली, AI से बना रहे हैं: दृश्य {i + 1}"
+                        f"मेल खाती तस्वीर नहीं मिली, AI से बना रहे हैं: दृश्य {i + 1}"
                     )
-                    prompt = english or (queries[0] if queries else "")
+                    if plan and plan.get("ai"):
+                        prompt = str(plan["ai"])
+                    else:
+                        english = english or translate_hi_en(scene)
+                        prompt = f"{anchor}, {english}"[:500]
                     if ai_image(prompt, path, size):
                         source, query = "AI", prompt[:80]
 
@@ -582,7 +750,7 @@ if st.button("🎬 वीडियो बनाना शुरू करें"
 
         if missing:
             st.warning(
-                f"इन दृश्यों की तस्वीर नहीं मिली: {missing}। "
+                f"इन दृश्यों की मेल खाती तस्वीर नहीं मिली: {missing}। "
                 "वहाँ पिछली तस्वीर या सादा रंग लगाया गया है।"
             )
 
