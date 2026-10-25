@@ -1,6 +1,7 @@
-streamlit
+streamlit>=1.37
 requests
 pillow
+pillow-heif
 edge-tts
 imageio-ffmpeg
 deep-translator
