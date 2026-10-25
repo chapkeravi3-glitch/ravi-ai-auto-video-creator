@@ -303,6 +303,36 @@ def llm_query(scene, topic):
         return None
 
 
+def visual_prompt(scene, topic, anchor, english=""):
+    """दृश्य की कथा से एक ठोस English तस्वीर-विवरण बनाता है (AI तस्वीर के लिए)।"""
+    ask = (
+        "Write ONE English sentence (max 35 words) describing a single realistic "
+        "photograph that illustrates this narration. Be concrete and visual: "
+        "place, objects, setting, lighting. "
+        f"Story topic: {topic[:200]}. "
+        f"Narration (Hindi): {scene[:400]}. "
+        "Reply with only the sentence."
+    )
+    try:
+        r = requests.get(
+            "https://text.pollinations.ai/" + quote(ask),
+            params={"model": "openai"},
+            headers=HEADERS,
+            timeout=40,
+        )
+        if r.status_code == 200:
+            t = r.text.strip().split("\n")[0].strip(" \"'")
+            if 15 <= len(t) <= 300 and "{" not in t:
+                return with_anchor(t, anchor)
+    except Exception:
+        pass
+
+    english = english or translate_hi_en(scene)
+    if english.strip():
+        return with_anchor(english.strip()[:300], anchor)
+    return ""  # विवरण नहीं बना तो बेमतलब तस्वीर नहीं बनाएँगे
+
+
 def with_anchor(query, anchor):
     if anchor and anchor.lower() not in query.lower():
         return f"{anchor} {query}"
@@ -459,7 +489,7 @@ def find_photo(queries, save_path, used, key, web_on, anchor):
 
 
 def ai_image(prompt, save_path, size):
-    if not prompt.strip():
+    if len(prompt.strip()) < 15:
         return False
 
     w, h = size
@@ -476,6 +506,7 @@ def ai_image(prompt, save_path, size):
                     "width": w,
                     "height": h,
                     "nologo": "true",
+                    "model": "flux",
                     "seed": random.randint(1, 1000000),
                 },
                 headers=HEADERS,
@@ -728,10 +759,9 @@ if st.button("🎬 वीडियो बनाना शुरू करें"
                     if plan and plan.get("ai"):
                         prompt = str(plan["ai"])
                     else:
-                        english = english or translate_hi_en(scene)
-                        prompt = f"{anchor}, {english}"[:500]
-                    if ai_image(prompt, path, size):
-                        source, query = "AI", prompt[:80]
+                        prompt = visual_prompt(scene, topic, anchor, english)
+                    if prompt and ai_image(prompt, path, size):
+                        source, query = "AI", prompt[:120]
 
                 if source:
                     images.append(path)
