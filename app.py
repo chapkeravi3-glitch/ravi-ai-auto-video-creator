@@ -5,81 +5,58 @@ import tempfile
 import os
 import re
 import asyncio
-import json
 import random
-from pathlib import Path
+import io
 from PIL import Image, ImageDraw
 import edge_tts
 import imageio_ffmpeg
 
 st.set_page_config(
-    page_title="Ravi AI Auto Video Creator",
+    page_title="Ravi AI Video Creator",
     page_icon="🎬",
     layout="wide"
 )
 
 st.title("🎬 Ravi AI Auto Video Creator")
-st.write("हिंदी स्क्रिप्ट से आवाज़ और फोटो इफेक्ट वाला वीडियो बनाएँ।")
+st.write("हिंदी कहानी से तस्वीरों और आवाज़ वाला वीडियो बनाएँ।")
 
 VOICES = {
     "हिंदी पुरुष": "hi-IN-MadhurNeural",
-    "हिंदी महिला": "hi-IN-SwaraNeural",
+    "हिंदी महिला": "hi-IN-SwaraNeural"
 }
 
 FORMATS = {
     "YouTube Shorts (9:16)": (720, 1280),
-    "YouTube Landscape (16:9)": (1280, 720),
-    "Square (1:1)": (720, 720),
+    "Landscape (16:9)": (1280, 720),
+    "Square (1:1)": (720, 720)
 }
 
-with st.expander("ℹ️ ऐप की जानकारी"):
-    st.write(
-        "यह ऐप हिंदी आवाज़, ऑनलाइन तस्वीरें और फोटो पर "
-        "Zoom/Pan जैसे इफेक्ट लगाकर MP4 वीडियो बनाती है। "
-        "यह वास्तविक AI-generated moving people नहीं बनाती।"
-    )
-
 script = st.text_area(
-    "📝 अपनी हिंदी स्क्रिप्ट लिखें",
-    height=260,
-    placeholder="यहाँ अपनी पूरी कहानी या वीडियो की स्क्रिप्ट डालें..."
+    "📝 पूरी हिंदी कहानी लिखें",
+    height=280
 )
 
-voice_label = st.selectbox(
-    "🎙️ आवाज़ चुनें",
-    list(VOICES.keys())
-)
-
-video_format = st.selectbox(
-    "📐 वीडियो का आकार",
-    list(FORMATS.keys())
-)
+voice_name = st.selectbox("🎙️ आवाज़", list(VOICES.keys()))
+format_name = st.selectbox("📐 वीडियो का आकार", list(FORMATS.keys()))
 
 effect = st.selectbox(
     "🎞️ फोटो इफेक्ट",
-    [
-        "धीमा Zoom In",
-        "धीमा Zoom Out",
-        "बाएँ से दाएँ Pan",
-        "दाएँ से बाएँ Pan",
-        "हल्का Rotation"
-    ]
+    ["Zoom In", "Zoom Out", "Pan Left to Right", "Pan Right to Left"]
 )
 
-fps = st.selectbox("वीडियो FPS", [24, 30], index=0)
-
-search_terms = st.text_input(
-    "🔎 तस्वीर खोजने के लिए English keywords (वैकल्पिक)",
-    placeholder="ancient Babylon, historical city, desert"
+keywords = st.text_input(
+    "🔎 वैकल्पिक English keywords",
+    placeholder="Ancient Babylon, historical city"
 )
 
 uploaded_images = st.file_uploader(
-    "🖼️ चाहें तो अपनी तस्वीरें अपलोड करें",
+    "अपनी तस्वीरें भी लगा सकते हैं",
     type=["jpg", "jpeg", "png", "webp"],
     accept_multiple_files=True
 )
 
-def split_script(text):
+
+def split_scenes(text):
     paragraphs = [
         p.strip()
         for p in re.split(r"\n\s*\n", text)
@@ -90,13 +67,11 @@ def split_script(text):
         return paragraphs
 
     sentences = re.split(r"(?<=[।!?])\s+", text.strip())
-    sentences = [s.strip() for s in sentences if s.strip()]
-
     scenes = []
     current = ""
 
     for sentence in sentences:
-        if len(current) + len(sentence) > 350 and current:
+        if len(current) + len(sentence) > 260 and current:
             scenes.append(current.strip())
             current = sentence
         else:
@@ -108,112 +83,88 @@ def split_script(text):
     return scenes or [text.strip()]
 
 
-def make_placeholder(path, text, size):
-    image = Image.new("RGB", size, (30, 35, 50))
-    draw = ImageDraw.Draw(image)
-
-    words = text[:160]
-    lines = []
-    for i in range(0, len(words), 28):
-        lines.append(words[i:i + 28])
-
-    y = size[1] // 3
-    for line in lines[:5]:
-        draw.text((30, y), line, fill="white")
-        y += 30
-
-    image.save(path, "JPEG")
-
-
-def search_commons_image(query, output_path):
-    if not query.strip():
-        return False
-
+def search_images(query, save_path):
     api = "https://commons.wikimedia.org/w/api.php"
 
-    params = {
-        "action": "query",
-        "format": "json",
-        "generator": "search",
-        "gsrsearch": query + " filetype:bitmap",
-        "gsrnamespace": 6,
-        "gsrlimit": 10,
-        "prop": "imageinfo",
-        "iiprop": "url",
-        "iiurlwidth": 1200,
-    }
-
     headers = {
-        "User-Agent": "RaviAIVideoCreator/1.0 (educational video project)"
+        "User-Agent": "RaviAIVideoCreator/1.0 (personal video project)"
     }
 
-    try:
-        response = requests.get(
-            api,
-            params=params,
-            headers=headers,
-            timeout=20
-        )
-        response.raise_for_status()
-        data = response.json()
+    queries = [query]
 
-        pages = data.get("query", {}).get("pages", {})
-        candidates = list(pages.values())
-        random.shuffle(candidates)
+    # वैकल्पिक keywords से तस्वीर न मिले तो दृश्य के शब्द भी आजमाएँ।
+    if query:
+        queries.append(" ".join(query.split()[:3]))
 
-        for page in candidates:
-            info = page.get("imageinfo", [{}])[0]
-            url = info.get("thumburl") or info.get("url")
+    for search_query in queries:
+        try:
+            params = {
+                "action": "query",
+                "format": "json",
+                "generator": "search",
+                "gsrsearch": search_query,
+                "gsrnamespace": 6,
+                "gsrlimit": 15,
+                "prop": "imageinfo",
+                "iiprop": "url",
+                "iiurlwidth": 1200
+            }
 
-            if not url:
-                continue
-
-            image_response = requests.get(
-                url,
+            response = requests.get(
+                api,
+                params=params,
                 headers=headers,
                 timeout=25
             )
-            image_response.raise_for_status()
+            response.raise_for_status()
 
-            with Image.open(
-                __import__("io").BytesIO(image_response.content)
-            ) as img:
-                img.convert("RGB").save(
-                    output_path,
-                    "JPEG",
-                    quality=90
+            pages = response.json().get("query", {}).get("pages", {})
+            candidates = list(pages.values())
+            random.shuffle(candidates)
+
+            for page in candidates:
+                info = page.get("imageinfo", [{}])[0]
+                url = info.get("thumburl") or info.get("url")
+
+                if not url:
+                    continue
+
+                image_response = requests.get(
+                    url,
+                    headers=headers,
+                    timeout=25
                 )
+                image_response.raise_for_status()
 
-            return True
+                with Image.open(
+                    io.BytesIO(image_response.content)
+                ) as img:
+                    img.convert("RGB").save(
+                        save_path,
+                        "JPEG",
+                        quality=90
+                    )
 
-    except Exception:
-        return False
+                return True
+
+        except Exception:
+            continue
 
     return False
 
 
-async def create_voice(text, voice, output_path):
-    communicate = edge_tts.Communicate(
+async def make_voice(text, voice, path):
+    communicator = edge_tts.Communicate(
         text=text,
-        voice=voice,
-        rate="+0%",
-        volume="+0%"
+        voice=voice
     )
-    await communicate.save(output_path)
+    await communicator.save(path)
 
 
-def get_duration(audio_path, ffmpeg):
-    command = [
-        ffmpeg,
-        "-i", audio_path,
-        "-f", "null",
-        "-"
-    ]
-
+def audio_duration(path, ffmpeg):
     result = subprocess.run(
-        command,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        [ffmpeg, "-i", path, "-f", "null", "-"],
+        capture_output=True,
         text=True
     )
 
@@ -223,115 +174,97 @@ def get_duration(audio_path, ffmpeg):
     )
 
     if not match:
-        raise RuntimeError("ऑडियो की अवधि पता नहीं चल सकी।")
+        raise RuntimeError("आवाज़ की अवधि नहीं मिल सकी।")
 
-    hours, minutes, seconds = match.groups()
-
-    return (
-        int(hours) * 3600
-        + int(minutes) * 60
-        + float(seconds)
-    )
+    h, m, s = match.groups()
+    return int(h) * 3600 + int(m) * 60 + float(s)
 
 
-def render_video(images, audio_path, output_path, size, fps, effect):
+def create_video(images, audio, output, size, effect):
     ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
     width, height = size
-    duration = get_duration(audio_path, ffmpeg)
+    duration = audio_duration(audio, ffmpeg)
 
-    count = len(images)
-    scene_duration = duration / count
+    scene_count = len(images)
+    scene_duration = duration / scene_count
+    fps = 24
 
-    command = [ffmpeg, "-y", "-hide_banner", "-loglevel", "error"]
+    cmd = [ffmpeg, "-y", "-hide_banner", "-loglevel", "error"]
 
-    for image_path in images:
-        command.extend([
+    for path in images:
+        cmd += [
             "-loop", "1",
             "-framerate", str(fps),
             "-t", str(scene_duration),
-            "-i", image_path
-        ])
+            "-i", path
+        ]
 
-    command.extend(["-i", audio_path])
+    cmd += ["-i", audio]
 
     filters = []
 
-    for i in range(count):
-        if effect == "धीमा Zoom Out":
-            zoom = (
-                f"zoompan=z='max(1.0,1.12-0.12*on/"
-                f"{max(1, int(scene_duration * fps))})'"
+    for i in range(scene_count):
+        base = (
+            f"scale={width}:{height}:"
+            "force_original_aspect_ratio=increase,"
+            f"crop={width}:{height}"
+        )
+
+        frames = max(1, int(scene_duration * fps))
+
+        if effect == "Zoom Out":
+            motion = (
+                f"zoompan=z='max(1.0,1.12-0.12*on/{frames})':"
+                f"d=1:s={width}x{height}:fps={fps}"
             )
-        elif effect == "बाएँ से दाएँ Pan":
-            zoom = (
+        elif effect == "Pan Left to Right":
+            motion = (
                 f"zoompan=z='1.12':"
-                f"x='(iw-iw/zoom)*on/"
-                f"{max(1, int(scene_duration * fps))}'"
+                f"x='(iw-iw/zoom)*on/{frames}':"
+                f"y='(ih-ih/zoom)/2':"
+                f"d=1:s={width}x{height}:fps={fps}"
             )
-        elif effect == "दाएँ से बाएँ Pan":
-            zoom = (
+        elif effect == "Pan Right to Left":
+            motion = (
                 f"zoompan=z='1.12':"
-                f"x='(iw-iw/zoom)*(1-on/"
-                f"{max(1, int(scene_duration * fps))})'"
-            )
-        elif effect == "हल्का Rotation":
-            zoom = "rotate='0.015*sin(2*PI*t/4)':c=black"
-        else:
-            zoom = (
-                f"zoompan=z='min(zoom+0.001,1.12)'"
-            )
-
-        if effect in ["बाएँ से दाएँ Pan", "दाएँ से बाएँ Pan"]:
-            zoom += f":y='(ih-ih/zoom)/2':d=1:s={width}x{height}:fps={fps}"
-        elif effect == "हल्का Rotation":
-            zoom = (
-                f"scale={width}:{height}:force_original_aspect_ratio=increase,"
-                f"crop={width}:{height},{zoom},"
-                f"scale={width}:{height},setsar=1,fps={fps}"
+                f"x='(iw-iw/zoom)*(1-on/{frames})':"
+                f"y='(ih-ih/zoom)/2':"
+                f"d=1:s={width}x{height}:fps={fps}"
             )
         else:
-            zoom += f":d=1:s={width}x{height}:fps={fps}"
-
-        if effect != "हल्का Rotation":
-            base = (
-                f"scale={width}:{height}:"
-                f"force_original_aspect_ratio=increase,"
-                f"crop={width}:{height},"
-            )
-            filters.append(
-                f"[{i}:v]{base}{zoom},setsar=1,format=yuv420p[v{i}]"
-            )
-        else:
-            filters.append(
-                f"[{i}:v]{zoom},setsar=1,format=yuv420p[v{i}]"
+            motion = (
+                f"zoompan=z='min(zoom+0.001,1.12)':"
+                f"d=1:s={width}x{height}:fps={fps}"
             )
 
-    concat_inputs = "".join(f"[v{i}]" for i in range(count))
+        filters.append(
+            f"[{i}:v]{base},{motion},"
+            f"setsar=1,format=yuv420p[v{i}]"
+        )
+
+    joined = "".join(f"[v{i}]" for i in range(scene_count))
+
     filters.append(
-        f"{concat_inputs}concat=n={count}:v=1:a=0[vout]"
+        f"{joined}concat=n={scene_count}:v=1:a=0[vout]"
     )
 
-    filter_complex = ";".join(filters)
-
-    command.extend([
-        "-filter_complex", filter_complex,
+    cmd += [
+        "-filter_complex", ";".join(filters),
         "-map", "[vout]",
-        "-map", f"{count}:a",
+        "-map", f"{scene_count}:a",
         "-t", str(duration),
         "-c:v", "libx264",
         "-preset", "ultrafast",
         "-pix_fmt", "yuv420p",
         "-c:a", "aac",
-        "-b:a", "128k",
         "-shortest",
         "-movflags", "+faststart",
-        output_path
-    ])
+        output
+    ]
 
     result = subprocess.run(
-        command,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        cmd,
+        capture_output=True,
         text=True
     )
 
@@ -341,105 +274,101 @@ def render_video(images, audio_path, output_path, size, fps, effect):
 
 if st.button("🎬 वीडियो बनाना शुरू करें", type="primary"):
     if not script.strip():
-        st.error("पहले अपनी स्क्रिप्ट लिखें।")
+        st.error("पहले कहानी लिखें।")
         st.stop()
 
-    progress = st.progress(0)
-    status = st.empty()
-
     try:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            scenes = split_script(script)
+        with tempfile.TemporaryDirectory() as folder:
+            scenes = split_scenes(script)
             images = []
+            failed = []
+            progress = st.progress(0)
+            status = st.empty()
 
-            # अपलोड की गई तस्वीरें पहले इस्तेमाल होंगी।
-            upload_paths = []
+            uploads = []
 
             for i, uploaded in enumerate(uploaded_images or []):
-                path = os.path.join(temp_dir, f"upload_{i}.jpg")
-
+                path = os.path.join(folder, f"upload_{i}.jpg")
                 with Image.open(uploaded) as img:
-                    img.convert("RGB").save(path, "JPEG", quality=90)
+                    img.convert("RGB").save(path, "JPEG")
+                uploads.append(path)
 
-                upload_paths.append(path)
-
-            status.info("1/4: तस्वीरें तैयार हो रही हैं...")
-
+            # हर दृश्य के लिए अलग तस्वीर
             for i, scene in enumerate(scenes):
-                path = os.path.join(temp_dir, f"scene_{i}.jpg")
+                status.info(
+                    f"तस्वीर खोज रहे हैं: दृश्य {i + 1}/{len(scenes)}"
+                )
 
-                if i < len(upload_paths):
-                    images.append(upload_paths[i])
+                if i < len(uploads):
+                    images.append(uploads[i])
                 else:
-                    query = search_terms.strip()
+                    path = os.path.join(folder, f"scene_{i}.jpg")
+
+                    # keywords के अलग हिस्से अलग दृश्यों के लिए इस्तेमाल हों।
+                    keyword_parts = keywords.split(",")
+                    if keyword_parts:
+                        query = keyword_parts[i % len(keyword_parts)].strip()
+                    else:
+                        query = ""
 
                     if not query:
-                        # स्क्रिप्ट के शुरुआती शब्द खोजने की कोशिश।
-                        query = " ".join(scene.split()[:5])
+                        query = " ".join(scene.split()[:6])
 
-                    found = search_commons_image(query, path)
+                    found = search_images(query, path)
 
-                    if not found:
-                        make_placeholder(path, scene, (900, 600))
-
-                    images.append(path)
+                    if found:
+                        images.append(path)
+                    else:
+                        failed.append(i + 1)
 
                 progress.progress(
-                    min(25, int(25 * (i + 1) / len(scenes)))
+                    int((i + 1) / len(scenes) * 45)
                 )
 
-            status.info("2/4: हिंदी आवाज़ बन रही है...")
+            if not images:
+                st.error(
+                    "एक भी तस्वीर डाउनलोड नहीं हुई। "
+                    "इंटरनेट या Wikimedia Commons की पहुँच जाँचें।"
+                )
+                st.stop()
 
-            audio_path = os.path.join(temp_dir, "narration.mp3")
+            if failed:
+                st.warning(
+                    f"इन दृश्यों की तस्वीर नहीं मिली: {failed}. "
+                    "वीडियो में केवल मिली हुई तस्वीरें रहेंगी।"
+                )
+
+            status.info("हिंदी आवाज़ बनाई जा रही है...")
+            audio = os.path.join(folder, "voice.mp3")
 
             asyncio.run(
-                create_voice(
-                    script,
-                    VOICES[voice_label],
-                    audio_path
-                )
+                make_voice(script, VOICES[voice_name], audio)
             )
 
-            progress.progress(40)
-            status.info("3/4: वीडियो रेंडर हो रहा है...")
+            status.info("वीडियो बनाया जा रहा है...")
+            output = os.path.join(folder, "video.mp4")
 
-            output_path = os.path.join(temp_dir, "ravi_video.mp4")
-
-            render_video(
+            create_video(
                 images,
-                audio_path,
-                output_path,
-                FORMATS[video_format],
-                fps,
+                audio,
+                output,
+                FORMATS[format_name],
                 effect
             )
 
-            progress.progress(100)
-            status.success("वीडियो तैयार है!")
+            with open(output, "rb") as f:
+                video_bytes = f.read()
 
-            with open(output_path, "rb") as video_file:
-                video_bytes = video_file.read()
-
+            st.success("वीडियो तैयार है!")
             st.video(video_bytes)
 
             st.download_button(
-                "⬇️ MP4 वीडियो डाउनलोड करें",
+                "⬇️ MP4 डाउनलोड करें",
                 data=video_bytes,
-                file_name="ravi_ai_video.mp4",
-                mime="video/mp4",
-                type="primary"
+                file_name="ravi_video.mp4",
+                mime="video/mp4"
             )
 
-            st.info(
-                "ध्यान दें: Wikimedia Commons की तस्वीरों के लाइसेंस "
-                "और attribution की शर्तें जाँचें। कुछ दृश्यों में "
-                "तस्वीर न मिलने पर टेक्स्ट वाली तस्वीर बनेगी।"
-            )
-
-    except Exception as error:
-        st.error("वीडियो नहीं बन पाया।")
-        st.code(str(error))
-        st.info(
-            "इंटरनेट कनेक्शन जाँचें। बहुत लंबी स्क्रिप्ट को "
-            "पहले छोटे हिस्से में आज़माएँ।"
-                 )
+    except Exception as e:
+        st.error("वीडियो बनाने में समस्या आई।")
+        st.code(str(e))
