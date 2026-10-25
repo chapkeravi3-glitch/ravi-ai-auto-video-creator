@@ -13,9 +13,15 @@ import shutil
 import time
 import hashlib
 from urllib.parse import quote
-from PIL import Image, ImageFont
+from PIL import Image, ImageFont, ImageOps, ImageStat
 import edge_tts
 import imageio_ffmpeg
+
+try:
+    import pillow_heif
+    pillow_heif.register_heif_opener()
+except Exception:
+    pass
 
 # requirements.txt:
 # streamlit
@@ -25,6 +31,7 @@ import imageio_ffmpeg
 # imageio-ffmpeg
 # deep-translator
 # ddgs
+# pillow-heif
 #
 # packages.txt (हिंदी कैप्शन के फ़ॉन्ट के लिए, Streamlit Cloud पर):
 # fonts-noto-core
@@ -72,7 +79,8 @@ LEAD = 0.25    # नई तस्वीर आने के बाद आवा�
 PAD = 0.35     # दृश्य के अंत में ठहराव
 TRANS = 0.5    # दृश्यों के बीच ट्रांज़िशन की अवधि
 GEMINI_MODELS = ["gemini-3.5-flash", "gemini-3.5-flash-lite", "gemini-3-flash-preview"]
-HEADERS = {"User-Agent": "RaviAIVideoCreator/5.0 (personal video project)"}
+HEADERS = {"User-Agent": "RaviAIVideoCreator/6.0 (personal video project)"}
+APP_VERSION = "संस्करण 6 (26 अक्टूबर 2026)"
 
 CAPTION_SIZES = {"छोटा": 0.050, "मध्यम": 0.066, "बड़ा": 0.082}
 
@@ -170,6 +178,93 @@ def parse_json(text):
     return None
 
 
+def gemini_models(key):
+    """Google से बताए गए उपलब्ध flash मॉडल (नाम बदलते रहते हैं)।"""
+    try:
+        r = requests.get(
+            "https://generativelanguage.googleapis.com/v1beta/models",
+            params={"pageSize": 100},
+            headers={"x-goog-api-key": key},
+            timeout=30,
+        )
+        if r.status_code != 200:
+            return [], f"{r.status_code}: {r.text[:200]}"
+        names = []
+        for m in r.json().get("models", []):
+            n = m.get("name", "").replace("models/", "")
+            low = n.lower()
+            if "generateContent" not in (m.get("supportedGenerationMethods") or []):
+                continue
+            if "flash" not in low:
+                continue
+            if any(x in low for x in (
+                "image", "tts", "live", "audio", "embedding", "thinking",
+                "robotics", "computer", "vision", "learnlm", "gemma",
+            )):
+                continue
+            names.append(n)
+
+        def rank(n):
+            nums = re.findall(r"\d+(?:\.\d+)?", n)
+            v = float(nums[0]) if nums else 0.0
+            return (-v, "lite" in n.lower(), "preview" in n.lower() or "exp" in n.lower())
+
+        names.sort(key=rank)
+        return names[:4], ""
+    except Exception as e:
+        return [], str(e)[:200]
+
+
+def gemini_generate(key, prompt, models):
+    errors = []
+    url = "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent"
+    for model in models:
+        for use_json in (True, False):
+            try:
+                body = {"contents": [{"parts": [{"text": prompt}]}]}
+                if use_json:
+                    body["generationConfig"] = {"responseMimeType": "application/json"}
+                r = requests.post(
+                    url.format(model),
+                    headers={"x-goog-api-key": key, "Content-Type": "application/json"},
+                    json=body,
+                    timeout=90,
+                )
+                if r.status_code == 200:
+                    cands = r.json().get("candidates") or []
+                    if cands:
+                        parts = cands[0].get("content", {}).get("parts", [])
+                        text = "".join(p.get("text", "") for p in parts)
+                        if text.strip():
+                            return text, ""
+                    errors.append(f"{model}: खाली जवाब")
+                    break
+                errors.append(f"{model} {r.status_code}: {r.text[:160]}")
+                if r.status_code == 429:
+                    time.sleep(5)
+                if r.status_code == 400 and use_json and "mime" in r.text.lower():
+                    continue  # JSON मोड नहीं चलता, बिना उसके दोबारा
+                if r.status_code in (400, 401, 403) and "key" in r.text.lower():
+                    return "", " | ".join(errors)[:500]  # key ही गलत है
+                break
+            except Exception as e:
+                errors.append(f"{model}: {str(e)[:100]}")
+                break
+    return "", " | ".join(errors)[:500]
+
+
+def test_gemini(key):
+    models, list_err = gemini_models(key)
+    if not models:
+        if list_err:
+            return False, f"key जाँच में समस्या: {list_err}"
+        models = GEMINI_MODELS
+    text, err = gemini_generate(key, 'Reply with the JSON {"ok": true}', models)
+    if text:
+        return True, f"key सही है ✅ (मॉडल: {models[0]})"
+    return False, f"काम नहीं बना: {err}"
+
+
 def plan_with_ai(scenes, opening, key, on_progress=None):
     """हर दृश्य के लिए तस्वीर की खोज और AI prompt, मुफ़्त Gemini से।"""
     anchor = ""
@@ -177,6 +272,10 @@ def plan_with_ai(scenes, opening, key, on_progress=None):
     plans = [None] * len(scenes)
     last_error = ""
     CH = 15
+    models, list_err = gemini_models(key)
+    if not models:
+        models = GEMINI_MODELS
+        last_error = list_err
 
     for start in range(0, len(scenes), CH):
         chunk = scenes[start:start + CH]
@@ -209,36 +308,12 @@ def plan_with_ai(scenes, opening, key, on_progress=None):
 
         data = None
         for attempt in range(2):
-            try:
-                text = ""
-                for model in GEMINI_MODELS:
-                    r = requests.post(
-                        "https://generativelanguage.googleapis.com/v1beta/"
-                        f"models/{model}:generateContent",
-                        headers={
-                            "x-goog-api-key": key,
-                            "Content-Type": "application/json",
-                        },
-                        json={
-                            "contents": [{"parts": [{"text": prompt}]}],
-                            "generationConfig": {
-                                "responseMimeType": "application/json"
-                            },
-                        },
-                        timeout=90,
-                    )
-                    if r.status_code == 200:
-                        parts = r.json()["candidates"][0]["content"]["parts"]
-                        text = "".join(p.get("text", "") for p in parts)
-                        break
-                    last_error = f"{model} {r.status_code}: {r.text[:150]}"
-                    if r.status_code == 429:
-                        time.sleep(6)
-                data = parse_json(text)
-                if data:
-                    break
-            except Exception as e:
-                last_error = str(e)[:200]
+            text, err = gemini_generate(key, prompt, models)
+            if err:
+                last_error = err
+            data = parse_json(text) if text else None
+            if data:
+                break
 
         if on_progress:
             on_progress(min(start + CH, len(scenes)))
@@ -427,9 +502,27 @@ def openverse_urls(query):
 OLD_YEAR = re.compile(r"\b(18\d\d|19\d\d|200\d|201[0-2])\b")
 
 
+def to_rgb(img):
+    """पारदर्शी हिस्से काले नहीं, सफ़ेद पृष्ठभूमि पर रखता है।"""
+    img = ImageOps.exif_transpose(img)
+    if img.mode in ("RGBA", "LA") or (img.mode == "P" and "transparency" in img.info):
+        rgba = img.convert("RGBA")
+        bg = Image.new("RGB", rgba.size, (255, 255, 255))
+        bg.paste(rgba, mask=rgba.split()[-1])
+        return bg
+    return img.convert("RGB")
+
+
+def is_blank(img):
+    """लगभग एक ही रंग की (काली/सफ़ेद/सादी) तस्वीर पहचानता है।"""
+    stat = ImageStat.Stat(img.convert("L").resize((64, 64)))
+    return stat.stddev[0] < 9 or stat.mean[0] < 12 or stat.mean[0] > 248
+
+
 def try_download(cands, save_path, used, words, max_tries=8,
-                 exclude=(), modern=False):
-    need = 2 if len(words) >= 3 else 1
+                 exclude=(), modern=False, need=None):
+    if need is None:
+        need = 2 if len(words) >= 3 else 1
     ex = [e.lower() for e in exclude if e]
     scored = []
     for url, text in cands:
@@ -458,10 +551,11 @@ def try_download(cands, save_path, used, words, max_tries=8,
             if len(r.content) > 15_000_000:
                 continue
             with Image.open(io.BytesIO(r.content)) as img:
-                if img.width < 500 or img.height < 350:
-                    continue
-                img.thumbnail((2000, 2000))
-                img.convert("RGB").save(save_path, "JPEG", quality=90)
+                rgb = to_rgb(img)
+            if rgb.width < 500 or rgb.height < 350 or is_blank(rgb):
+                continue
+            rgb.thumbnail((2000, 2000))
+            rgb.save(save_path, "JPEG", quality=90)
             used.add(url)
             return True
         except Exception:
@@ -470,9 +564,9 @@ def try_download(cands, save_path, used, words, max_tries=8,
 
 
 def find_photo(queries, save_path, used, key, web_on, anchor,
-               exclude=(), modern=False):
+               exclude=(), modern=False, relaxed=False):
     for q in queries:
-        words = match_words(q, anchor)
+        words = match_words("" if relaxed else q, anchor)
         sources = []
         if key:
             sources.append(("Pixabay", lambda q=q: pixabay_urls(q, key)))
@@ -484,6 +578,7 @@ def find_photo(queries, save_path, used, key, web_on, anchor,
             if try_download(
                 fetch(), save_path, used, words,
                 exclude=exclude, modern=modern,
+                need=1 if relaxed else None,
             ):
                 return name, q
     return None, None
@@ -501,49 +596,71 @@ def guess_modern(*texts):
 
 
 def ai_image(prompt, save_path, size):
+    """Pollinations से तस्वीर बनवाता है (बिना key)। खाली/ख़राब तस्वीर नकारता है।"""
     if len(prompt.strip()) < 15:
         return False
 
     w, h = size
+    scale = 1024 / max(w, h)
+    w = max(256, int(w * scale) // 8 * 8)
+    h = max(256, int(h * scale) // 8 * 8)
     full = (
         f"{prompt}, realistic photograph, natural lighting, "
         "high detail, no text, no watermark"
     )
 
-    for attempt in range(3):
-        try:
-            r = requests.get(
-                "https://image.pollinations.ai/prompt/" + quote(full[:600]),
-                params={
-                    "width": w,
-                    "height": h,
-                    "nologo": "true",
-                    "model": "flux",
+    started = time.time()
+    for rnd in range(2):
+        for model in ("flux", None):
+            if time.time() - started > 170:
+                return False
+            try:
+                params = {
+                    "width": w, "height": h, "nologo": "true",
                     "seed": random.randint(1, 1000000),
-                },
-                headers=HEADERS,
-                timeout=120,
-            )
-            if (
-                r.status_code == 200
-                and r.headers.get("content-type", "").startswith("image")
-            ):
-                with Image.open(io.BytesIO(r.content)) as img:
-                    img.convert("RGB").save(save_path, "JPEG", quality=90)
-                return True
-        except Exception:
-            pass
-        time.sleep(3 + attempt * 3)
+                }
+                if model:
+                    params["model"] = model
+                r = requests.get(
+                    "https://image.pollinations.ai/prompt/" + quote(full[:600]),
+                    params=params, headers=HEADERS, timeout=75,
+                )
+                if (
+                    r.status_code == 200
+                    and r.headers.get("content-type", "").startswith("image")
+                ):
+                    with Image.open(io.BytesIO(r.content)) as img:
+                        rgb = to_rgb(img)
+                    if rgb.width >= 256 and not is_blank(rgb):
+                        rgb.save(save_path, "JPEG", quality=92)
+                        return True
+                elif r.status_code == 429:
+                    time.sleep(8)
+            except Exception:
+                pass
+        time.sleep(4)
     return False
 
 
-def make_fallback_image(path, size, copy_from=None):
-    if copy_from and os.path.exists(copy_from):
-        shutil.copy(copy_from, path)
-    else:
-        Image.new("RGB", size, (20, 24, 40)).save(path, "JPEG", quality=90)
+def make_fallback_image(path, size, pool=None, avoid=None):
+    """तस्वीर न मिले तो पहले मिली किसी तस्वीर को दोहराएँ, नहीं तो रंगीन पृष्ठभूमि।"""
+    pool = [p for p in (pool or []) if p and os.path.exists(p)]
+    other = [p for p in pool if p != avoid]
+    chosen = other or pool  # रंगीन पृष्ठभूमि से बेहतर है मिली हुई तस्वीर दोहराना
+    if chosen:
+        shutil.copy(random.choice(chosen), path)
+        return "पहले की तस्वीर"
 
-
+    palettes = [
+        ("#1b2a6b", "#b21f66"), ("#0f2027", "#2c7a7b"),
+        ("#42275a", "#734b6d"), ("#232526", "#c9a227"),
+    ]
+    c1, c2 = random.choice(palettes)
+    grad = Image.linear_gradient("L").resize(size)
+    if random.random() < 0.5:
+        grad = grad.rotate(90, expand=True).resize(size)
+    ImageOps.colorize(grad, c1, c2).save(path, "JPEG", quality=90)
+    return "रंगीन पृष्ठभूमि"
 
 # ---------------------------------------------------------------- आवाज़
 def voice_params(text, speed_pct, natural):
@@ -756,22 +873,28 @@ def write_ass(path, cues, size, font_path, size_ratio, lead):
 
 
 # ---------------------------------------------------------------- वीडियो क्लिप
+ZOOM = 1.22  # अधिकतम ज़ूम
+
+
 def motion_filter(effect, frames, w, h):
+    # धीमी शुरुआत और धीमा अंत (ease in-out), ताकि हलचल सिनेमा जैसी लगे
+    p = f"(on/{frames})"
+    e = f"({p}*{p}*(3-2*{p}))"
     cx = "iw/2-(iw/zoom/2)"
     cy = "ih/2-(ih/zoom/2)"
 
     if effect == "Zoom Out":
-        z, x, y = f"1.14-0.14*on/{frames}", cx, cy
+        z, x, y = f"{ZOOM}-{ZOOM - 1}*{e}", cx, cy
     elif effect == "Pan Left to Right":
-        z = "1.14"
-        x = f"(iw-iw/zoom)*on/{frames}"
+        z = f"{ZOOM}"
+        x = f"(iw-iw/zoom)*{e}"
         y = "(ih-ih/zoom)/2"
     elif effect == "Pan Right to Left":
-        z = "1.14"
-        x = f"(iw-iw/zoom)*(1-on/{frames})"
+        z = f"{ZOOM}"
+        x = f"(iw-iw/zoom)*(1-{e})"
         y = "(ih-ih/zoom)/2"
     else:  # Zoom In
-        z, x, y = f"1+0.14*on/{frames}", cx, cy
+        z, x, y = f"1+{ZOOM - 1}*{e}", cx, cy
 
     return (
         f"zoompan=z='{z}':x='{x}':y='{y}':"
@@ -787,11 +910,11 @@ def end_state_filter(effect, w, h):
     if effect == "Zoom Out":
         z, x, y = "1.0", "0", "0"
     elif effect == "Pan Left to Right":
-        z, x, y = "1.14", "iw-iw/zoom", "(ih-ih/zoom)/2"
+        z, x, y = f"{ZOOM}", "iw-iw/zoom", "(ih-ih/zoom)/2"
     elif effect == "Pan Right to Left":
-        z, x, y = "1.14", "0", "(ih-ih/zoom)/2"
+        z, x, y = f"{ZOOM}", "0", "(ih-ih/zoom)/2"
     else:
-        z, x, y = "1.14", cx, cy
+        z, x, y = f"{ZOOM}", cx, cy
 
     return (
         f"zoompan=z='{z}':x='{x}':y='{y}':d=1:s={w}x{h}:fps={FPS}"
@@ -815,7 +938,8 @@ def make_clip(image, prev, prev_effect, audio, voice_len, cues, out, size,
     w, h = size
     total = LEAD + voice_len + pad
     frames = max(1, math.ceil(total * FPS))
-    bw, bh = w * 3 // 2, h * 3 // 2
+    k = 1.5 if max(w, h) <= 1300 else 1.3
+    bw, bh = int(w * k) // 2 * 2, int(h * k) // 2 * 2
 
     cmd = [ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-i", image]
     graph = [
@@ -869,7 +993,7 @@ def make_clip(image, prev, prev_effect, audio, voice_len, cues, out, size,
         f"adelay={int(LEAD * 1000)}|{int(LEAD * 1000)},apad=pad_dur={pad}",
         "-t", f"{total:.3f}",
         "-r", str(FPS),
-        "-c:v", "libx264", "-preset", "veryfast", "-crf", "22",
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
         "-pix_fmt", "yuv420p",
         "-c:a", "aac", "-b:a", "160k", "-ar", "44100", "-ac", "2",
         out,
@@ -998,10 +1122,31 @@ for _id, _p in list(JOBS.items()):
 
 
 def set_state(P, status=None, progress=None):
+    P["heartbeat"] = time.time()
+    if P.get("cancel"):
+        raise RuntimeError("आपके कहने पर रोक दिया गया।")
     if status is not None:
         P["status"] = status
     if progress is not None:
         P["progress"] = int(progress)
+
+
+def publish_static(P, path):
+    """वीडियो की ऐसी कॉपी रखें जिसका सीधा डाउनलोड लिंक बन सके।"""
+    P["static_name"] = ""
+    try:
+        base = os.path.dirname(os.path.abspath(__file__))
+        d = os.path.join(base, "static")
+        os.makedirs(d, exist_ok=True)
+        for old in os.listdir(d):
+            op = os.path.join(d, old)
+            if old.startswith("ravi_") and time.time() - os.path.getmtime(op) > 6 * 3600:
+                os.remove(op)
+        name = f"ravi_{P['id']}_{int(time.time())}.mp4"
+        shutil.copy(path, os.path.join(d, name))
+        P["static_name"] = name
+    except Exception:
+        P["static_name"] = ""
 
 
 def draft_job(P, cfg):
@@ -1132,12 +1277,22 @@ def draft_job(P, cfg):
                 if prompt and ai_image(prompt, path, size):
                     source, query = "AI", prompt[:120]
 
+            if not source and anchor:
+                set_state(P, f"विषय से जुड़ी सामान्य तस्वीर खोज रहे हैं: दृश्य {i + 1}")
+                source, query = find_photo(
+                    [anchor], path, used, cfg["pixabay_key"], cfg["use_web"],
+                    anchor, exclude=exclude, modern=modern, relaxed=True,
+                )
+
             if source:
                 sc.update(image=path, source=source, query=query)
                 last_good = path
+                P.setdefault("good", []).append(path)
             else:
-                make_fallback_image(path, size, last_good)
-                sc.update(image=path, source="खाली", query="")
+                label = make_fallback_image(
+                    path, size, P.get("good"), avoid=last_good
+                )
+                sc.update(image=path, source=label, query="")
                 P.setdefault("missing", []).append(i + 1)
 
             save_project(P)
@@ -1145,7 +1300,7 @@ def draft_job(P, cfg):
         if P.get("missing"):
             P["note"] = (P.get("note", "") +
                          f" इन दृश्यों की मेल खाती तस्वीर नहीं मिली: {sorted(set(P['missing']))}। "
-                         "एडिटर में इनकी तस्वीर बदलें।").strip()
+                         "इनमें पहले की तस्वीर या रंगीन पृष्ठभूमि लगी है।").strip()
 
         P["draft_done"] = True
         set_state(P, "ड्राफ़्ट तैयार है", 100)
@@ -1231,6 +1386,7 @@ def render_job(P, cfg):
             add_music(joined, cfg["music"], final, cfg["music_vol"], ffmpeg)
 
         P["video"] = final
+        publish_static(P, final)
         set_state(P, "वीडियो तैयार है!", 100)
         P["state"] = "done"
         save_project(P)
@@ -1242,6 +1398,7 @@ def render_job(P, cfg):
 
 def full_job(P, cfg):
     """कहानी से तैयार वीडियो तक पूरा काम (रुकने पर वहीं से आगे बढ़ता है)।"""
+    P["cancel"] = False
     if not P.get("draft_done"):
         draft_job(P, dict(cfg, chain=True))
         if not P.get("draft_done"):
@@ -1259,79 +1416,196 @@ def start_thread(fn, P, cfg):
 
 # ==== UI ====
 st.title("🎬 Ravi AI Auto Video Creator")
-st.write("सिर्फ़ हिंदी कहानी डालें। कहानी के हिसाब से तस्वीरें चुनकर एनिमेशन वाला वीडियो बनेगा।")
+st.caption(APP_VERSION)
 
 pid = st.query_params.get("p")
 P = JOBS.get(pid) if pid else None
-if P is None and JOBS:
+if P is None and JOBS and not st.session_state.get("fresh"):
     # लिंक में पहचान न हो (जैसे ऐप दोबारा खोला) तो आख़िरी प्रोजेक्ट खोलें
     P = max(JOBS.values(), key=lambda p: p.get("created", 0))
     st.query_params["p"] = P["id"]
 
+# अटका हुआ काम पहचानें (15 मिनट से कोई हलचल नहीं)
+if P and P["state"] in ("drafting", "rendering"):
+    if time.time() - P.get("heartbeat", P.get("created", time.time())) > 900:
+        P["state"] = "error"
+        P["error"] = "काम बहुत देर से अटका हुआ था, इसलिए रोक दिया गया।"
+
 busy = bool(P) and P["state"] in ("drafting", "rendering")
 
-# ---------------------------------------------------------------- इनपुट
-script = st.text_area("📝 पूरी हिंदी कहानी लिखें", height=280)
 
-col1, col2 = st.columns(2)
-with col1:
-    voice_name = st.selectbox("🎙️ आवाज़", list(VOICES.keys()))
-    speed = st.slider("बोलने की गति", -25, 15, -5, 1, help="ऋण का मतलब थोड़ा धीरे")
-    format_name = st.selectbox("📐 वीडियो का आकार", list(FORMATS.keys()))
-with col2:
-    effect_choice = st.selectbox(
-        "🎞️ फोटो इफेक्ट", ["Auto (हर दृश्य में अलग)"] + EFFECTS
+def go_new():
+    st.session_state["fresh"] = True
+    st.query_params.clear()
+    st.rerun()
+
+
+# ---------------------------------------------------------------- चल रहा काम
+if busy:
+    st.progress(min(100, P["progress"]))
+    st.info(P["status"])
+    st.caption(
+        "💡 काम सर्वर पर चलता है। फ़ोन की स्क्रीन बंद हो जाए तो भी चलता रहेगा। "
+        "ऐप दोबारा खोलने पर यहीं से आगे दिखेगा। रुक जाए तो बना हुआ काम दोबारा नहीं बनेगा।"
     )
-    max_chars = st.slider(
-        "✂️ एक दृश्य में अधिकतम अक्षर (कम = तस्वीरें जल्दी-जल्दी बदलेंगी)",
-        60, 400, 140, 10,
+    if st.button("⏹️ रोकें"):
+        P["cancel"] = True
+        P["status"] = "रोका जा रहा है..."
+    time.sleep(3)
+    st.rerun()
+
+# ---------------------------------------------------------------- तैयार वीडियो / अधूरा काम
+resume_clicked = False
+if P is not None:
+    video_ready = bool(P.get("video")) and os.path.exists(P["video"])
+
+    if P.get("note"):
+        st.warning(P["note"])
+    if P["state"] == "error" and P.get("error"):
+        st.error("बीच में समस्या आई।")
+        st.code(P["error"][-600:])
+
+    if video_ready:
+        st.success("वीडियो तैयार है!")
+        st.video(P["video"])
+
+        if P.get("static_name"):
+            st.markdown(
+                f'<a href="app/static/{P["static_name"]}" download="ravi_video.mp4" '
+                'style="display:block;text-align:center;padding:0.7rem 1rem;'
+                'border-radius:0.5rem;background:#ff4b4b;color:#fff;'
+                'font-weight:600;text-decoration:none;">'
+                "⬇️ वीडियो डाउनलोड करें</a>",
+                unsafe_allow_html=True,
+            )
+            st.caption(
+                "डाउनलोड के बाद वीडियो खुल जाए और वापस आने का रास्ता न दिखे, "
+                "तो इसी ऐप को दोबारा खोलें। आपका वीडियो यहीं सुरक्षित रहेगा।"
+            )
+        try:
+            with open(P["video"], "rb") as f:
+                st.download_button(
+                    "⬇️ दूसरा तरीका: MP4 डाउनलोड", data=f,
+                    file_name="ravi_video.mp4", mime="video/mp4",
+                    on_click="ignore",
+                )
+        except TypeError:
+            with open(P["video"], "rb") as f:
+                st.download_button(
+                    "⬇️ दूसरा तरीका: MP4 डाउनलोड", data=f,
+                    file_name="ravi_video.mp4", mime="video/mp4",
+                )
+
+        with st.expander("किस दृश्य में कौन-सी तस्वीर लगी"):
+            for i, sc in enumerate(P["scenes"]):
+                if sc.get("image") and os.path.exists(sc["image"]):
+                    st.image(
+                        sc["image"], width=180,
+                        caption=f"दृश्य {i + 1} | {sc['source']} | {sc['query'][:80]}",
+                    )
+    else:
+        done_n = sum(1 for sc in P["scenes"] if sc.get("image"))
+        if P["scenes"]:
+            st.warning(
+                f"वीडियो अभी पूरा नहीं बना (तस्वीरें {done_n}/{len(P['scenes'])})। "
+                "जो बन चुका है वह दोबारा नहीं बनेगा।"
+            )
+        resume_clicked = st.button("▶️ वहीं से आगे बढ़ाएँ", type="primary")
+
+    st.divider()
+    if st.button("🆕 नया वीडियो बनाएँ"):
+        go_new()
+
+# ---------------------------------------------------------------- इनपुट
+st.subheader("📝 कहानी और सेटिंग")
+script = st.text_area("पूरी हिंदी कहानी लिखें", height=260)
+
+voice_name = st.radio("🎙️ आवाज़", list(VOICES.keys()), horizontal=True)
+speed = st.slider("बोलने की गति", -25, 15, -5, 1, help="ऋण का मतलब थोड़ा धीरे")
+natural = st.checkbox(
+    "🗣️ प्राकृतिक आवाज़ (हर दृश्य में थोड़ी अलग गति/सुर, प्रश्न और विस्मय पर बदलाव)",
+    value=True,
+)
+if st.button("🔊 चुनी हुई आवाज़ सुनें"):
+    try:
+        sample = os.path.join(
+            tempfile.gettempdir(), f"ravi_sample_{int(time.time())}.mp3"
+        )
+        asyncio.run(synth(
+            "नमस्ते दोस्तो, आज हम एक बहुत रोचक कहानी सुनेंगे।",
+            VOICES[voice_name], sample, f"{int(speed):+d}%", "+0Hz",
+        ))
+        with open(sample, "rb") as f:
+            st.audio(f.read(), format="audio/mp3")
+    except Exception as e:
+        st.error(f"आवाज़ का नमूना नहीं बन सका: {e}")
+
+c1, c2 = st.columns(2)
+with c1:
+    format_name = st.selectbox("📐 वीडियो का आकार", list(FORMATS.keys()))
+    quality = st.selectbox(
+        "🎞️ वीडियो क्वालिटी",
+        ["HD 1080p (बेहतर, थोड़ा धीमा)", "सामान्य 720p (तेज़)"],
+    )
+with c2:
+    effect_choice = st.selectbox(
+        "✨ फोटो इफेक्ट", ["Auto (हर दृश्य में अलग)"] + EFFECTS
     )
     cap_name = st.select_slider(
         "कैप्शन का आकार", list(CAPTION_SIZES.keys()), value="मध्यम"
     )
 
-natural = st.checkbox(
-    "🗣️ प्राकृतिक आवाज़ (हर दृश्य में थोड़ी अलग गति/सुर, प्रश्न और विस्मय पर बदलाव)",
-    value=True,
+max_chars = st.slider(
+    "✂️ एक दृश्य में अधिकतम अक्षर (कम = तस्वीरें जल्दी-जल्दी बदलेंगी)",
+    60, 400, 110, 10,
 )
 captions_on = st.checkbox("💬 हिंदी कैप्शन (बोले जा रहे शब्द स्क्रीन पर)", value=True)
 use_web = st.checkbox(
     "🌐 इंटरनेट की तस्वीरों में खोजें (कॉपीराइट आपकी ज़िम्मेदारी है)", value=True
 )
-use_ai = st.checkbox(
-    "🤖 मेल खाती तस्वीर न मिले तो AI से बनाएँ (बेमेल तस्वीर लगाने से यह बेहतर है)",
-    value=True,
-)
+use_ai = st.checkbox("🤖 मेल खाती तस्वीर न मिले तो AI से बनाएँ", value=True)
 
 gemini_key = st.text_input(
     "Google Gemini API key (मुफ़्त; aistudio.google.com से; सबसे सटीक तस्वीरों के लिए)",
     type="password",
 )
+if st.button("🔑 key जाँचें"):
+    if not gemini_key.strip():
+        st.warning("पहले key चिपकाएँ।")
+    else:
+        ok, msg = test_gemini(gemini_key.strip())
+        (st.success if ok else st.error)(msg)
 
-with st.expander("और विकल्प (वैकल्पिक)"):
-    extra_topic = st.text_input(
-        "कहानी का मुख्य विषय English में (हर खोज में जुड़ेगा)",
-        placeholder="India vs Australia ODI 2026",
-    )
-    pixabay_key = st.text_input("Pixabay API key (मुफ़्त)", type="password")
+extra_topic = st.text_input(
+    "कहानी का मुख्य विषय English में (वैकल्पिक, हर खोज में जुड़ेगा)",
+    placeholder="India vs Australia ODI 2026",
+)
+pixabay_key = st.text_input("Pixabay API key (वैकल्पिक, मुफ़्त)", type="password")
 
 uploaded_images = st.file_uploader(
-    "अपनी तस्वीरें भी लगा सकते हैं (पहले दृश्यों में क्रम से लगेंगी)",
-    type=["jpg", "jpeg", "png", "webp"],
+    "🖼️ अपनी तस्वीरें (पहले दृश्यों में क्रम से लगेंगी)",
     accept_multiple_files=True,
+)
+if uploaded_images:
+    st.caption(f"✅ {len(uploaded_images)} फ़ाइल मिली")
+
+base_size = FORMATS[format_name]
+render_size = (
+    (base_size[0] * 3 // 2, base_size[1] * 3 // 2)
+    if quality.startswith("HD") else base_size
 )
 
 
-def make_cfg(size, resume=False, uploads=None):
+def make_cfg(resume=False, uploads=None):
     return {
         "resume": resume,
         "voice": VOICES[voice_name], "speed": speed, "natural": natural,
-        "max_chars": max_chars, "size": size,
+        "max_chars": max_chars, "size": render_size,
         "use_web": use_web, "use_ai": use_ai,
         "gemini_key": gemini_key.strip(), "pixabay_key": pixabay_key.strip(),
         "extra_topic": extra_topic, "uploads": uploads or [],
         "render": {
-            "size": size, "default_effect": effect_choice,
+            "size": render_size, "default_effect": effect_choice,
             "default_transition": "Auto (हर दृश्य अलग)",
             "captions": captions_on, "cap_ratio": CAPTION_SIZES[cap_name],
             "music": None, "music_vol": 0.1,
@@ -1339,9 +1613,14 @@ def make_cfg(size, resume=False, uploads=None):
     }
 
 
-start = st.button("🎬 वीडियो बनाना शुरू करें", type="primary", disabled=busy)
+if resume_clicked and P is not None:
+    P["error"], P["note"], P["cancel"] = "", "", False
+    P["heartbeat"] = time.time()
+    P["state"] = "drafting" if not P.get("draft_done") else "rendering"
+    start_thread(full_job, P, make_cfg(resume=True))
+    st.rerun()
 
-if start:
+if st.button("🎬 वीडियो बनाना शुरू करें", type="primary", disabled=busy):
     if not script.strip():
         st.error("पहले कहानी लिखें।")
         st.stop()
@@ -1353,81 +1632,34 @@ if start:
     new_id = hashlib.md5(f"{time.time()}{random.random()}".encode()).hexdigest()[:10]
     folder = tempfile.mkdtemp(prefix="ravi_video_")
 
-    uploads = []
+    uploads, bad = [], []
     for i, up in enumerate(uploaded_images or []):
-        p = os.path.join(folder, f"upload_{i}.jpg")
-        with Image.open(up) as img:
-            img.convert("RGB").save(p, "JPEG", quality=90)
-        uploads.append(p)
+        try:
+            p = os.path.join(folder, f"upload_{i}.jpg")
+            with Image.open(up) as img:
+                rgb = to_rgb(img)
+            rgb.thumbnail((2400, 2400))
+            rgb.save(p, "JPEG", quality=92)
+            uploads.append(p)
+        except Exception:
+            bad.append(up.name)
+    if bad:
+        st.warning(
+            "ये फ़ाइलें तस्वीर के रूप में नहीं खुलीं और छोड़ दी गईं: " + ", ".join(bad)
+        )
 
-    size = FORMATS[format_name]
     P = {
         "id": new_id, "folder": folder, "state": "drafting",
-        "created": time.time(), "script": script, "draft_done": False,
-        "planned": False, "status": "शुरू हो रहा है...", "progress": 0,
+        "created": time.time(), "heartbeat": time.time(),
+        "script": script, "draft_done": False, "planned": False,
+        "status": "शुरू हो रहा है...", "progress": 0,
         "note": "", "error": "", "scenes": [], "used": set(), "video": None,
         "anchor": "", "topic": "", "modern": False, "offset": 0,
         "voice": VOICES[voice_name], "speed": speed, "natural": natural,
-        "size": size,
+        "size": render_size, "cancel": False, "static_name": "",
     }
     JOBS[new_id] = P
-    start_thread(full_job, P, make_cfg(size, uploads=uploads))
+    st.session_state["fresh"] = False
+    start_thread(full_job, P, make_cfg(uploads=uploads))
     st.query_params["p"] = new_id
     st.rerun()
-
-# ---------------------------------------------------------------- स्थिति
-if P is None:
-    st.stop()
-
-if P["state"] in ("drafting", "rendering"):
-    st.progress(min(100, P["progress"]))
-    st.info(P["status"])
-    st.caption(
-        "💡 काम सर्वर पर चलता है। फ़ोन की स्क्रीन बंद हो जाए तो भी चलता रहेगा। "
-        "बाद में ऐप दोबारा खोलने पर यहीं से आगे दिखेगा। "
-        "रुक भी जाए तो बना हुआ काम दोबारा नहीं बनेगा।"
-    )
-    time.sleep(3)
-    st.rerun()
-
-video_ready = bool(P.get("video")) and os.path.exists(P["video"])
-
-if P.get("note"):
-    st.warning(P["note"])
-
-if P["state"] == "error" and P.get("error"):
-    st.error("बीच में समस्या आई।")
-    st.code(P["error"][-600:])
-
-if not video_ready:
-    done_n = sum(1 for sc in P["scenes"] if sc.get("image"))
-    if P["scenes"]:
-        st.warning(
-            f"वीडियो अभी पूरा नहीं बना (तस्वीरें {done_n}/{len(P['scenes'])})। "
-            "जो बन चुका है वह दोबारा नहीं बनेगा।"
-        )
-    if st.button("▶️ वहीं से आगे बढ़ाएँ", type="primary"):
-        P["error"], P["note"] = "", ""
-        P["state"] = "drafting" if not P.get("draft_done") else "rendering"
-        start_thread(
-            full_job, P, make_cfg(FORMATS[format_name], resume=True)
-        )
-        st.rerun()
-    st.stop()
-
-# ---------------------------------------------------------------- तैयार वीडियो
-st.success("वीडियो तैयार है!")
-st.video(P["video"])
-with open(P["video"], "rb") as f:
-    st.download_button(
-        "⬇️ MP4 डाउनलोड करें", data=f,
-        file_name="ravi_video.mp4", mime="video/mp4",
-    )
-
-with st.expander("किस दृश्य में कौन-सी तस्वीर लगी"):
-    for i, sc in enumerate(P["scenes"]):
-        if sc.get("image") and os.path.exists(sc["image"]):
-            st.image(
-                sc["image"], width=180,
-                caption=f"दृश्य {i + 1} | {sc['source']} | {sc['query'][:80]}",
-            )
