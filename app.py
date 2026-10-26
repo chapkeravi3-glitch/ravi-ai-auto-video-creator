@@ -442,21 +442,21 @@ def score_text(text, words):
 
 # ---------------------------------------------------------------- तस्वीर के स्रोत
 # हर स्रोत (url, शीर्षक/टैग) की सूची देता है, ताकि मेल जाँचा जा सके।
-def pixabay_urls(query, key):
+def _note(err, msg):
+    if err is not None:
+        err.append(msg)
+
+
+def pixabay_urls(query, key, err=None):
     lang = "hi" if re.search(r"[\u0900-\u097F]", query) else "en"
     try:
         r = requests.get(
             "https://pixabay.com/api/",
             params={
-                "key": key,
-                "q": query[:100],
-                "lang": lang,
-                "image_type": "photo",
-                "per_page": 30,
-                "safesearch": "true",
+                "key": key, "q": query[:100], "lang": lang,
+                "image_type": "photo", "per_page": 30, "safesearch": "true",
             },
-            headers=HEADERS,
-            timeout=25,
+            headers=HEADERS, timeout=25,
         )
         r.raise_for_status()
         out = []
@@ -464,28 +464,30 @@ def pixabay_urls(query, key):
             url = h.get("largeImageURL") or h.get("webformatURL")
             out.append((url, h.get("tags", "")))
         return out
-    except Exception:
+    except Exception as e:
+        _note(err, f"Pixabay: {str(e)[:90]}")
         return []
 
 
-def web_urls(query):
+def web_urls(query, err=None):
     if DDGS is None:
+        _note(err, "इंटरनेट खोज की लाइब्रेरी (ddgs) इंस्टॉल नहीं है")
         return []
     try:
         with DDGS() as d:
             results = list(d.images(query, max_results=25))
         return [(r.get("image"), r.get("title", "")) for r in results]
-    except Exception:
+    except Exception as e:
+        _note(err, f"इंटरनेट खोज: {type(e).__name__}: {str(e)[:90]}")
         return []
 
 
-def openverse_urls(query):
+def openverse_urls(query, err=None):
     try:
         r = requests.get(
             "https://api.openverse.org/v1/images/",
             params={"q": query, "page_size": 20, "mature": "false"},
-            headers=HEADERS,
-            timeout=25,
+            headers=HEADERS, timeout=25,
         )
         r.raise_for_status()
         out = []
@@ -495,8 +497,46 @@ def openverse_urls(query):
             out.append((item.get("url"), text))
             out.append((item.get("thumbnail"), text))
         return out
-    except Exception:
+    except Exception as e:
+        _note(err, f"Openverse: {str(e)[:90]}")
         return []
+
+
+def wikimedia_urls(query, err=None):
+    """ऐतिहासिक विषयों (जगह, राजा, इमारत) के लिए बहुत अच्छा स्रोत।"""
+    params = {
+        "action": "query", "format": "json", "generator": "search",
+        "gsrsearch": query, "gsrnamespace": 6, "gsrlimit": 20,
+        "prop": "imageinfo", "iiprop": "url|mime|extmetadata",
+        "iiurlwidth": 1600,
+    }
+    for attempt in range(2):
+        try:
+            r = requests.get(
+                "https://commons.wikimedia.org/w/api.php",
+                params=params, headers=HEADERS, timeout=25,
+            )
+            if r.status_code == 429:
+                time.sleep(2 + attempt * 2)
+                continue
+            r.raise_for_status()
+            pages = r.json().get("query", {}).get("pages", {})
+            out = []
+            for page in pages.values():
+                info = (page.get("imageinfo") or [{}])[0]
+                if info.get("mime") not in ("image/jpeg", "image/png"):
+                    continue
+                url = info.get("thumburl") or info.get("url")
+                meta = info.get("extmetadata") or {}
+                desc = re.sub(
+                    r"<[^>]+>", " ",
+                    (meta.get("ImageDescription") or {}).get("value", ""),
+                )
+                out.append((url, f"{page.get('title', '')} {desc}"))
+            return out
+        except Exception as e:
+            _note(err, f"Wikimedia: {str(e)[:90]}")
+    return []
 
 
 OLD_YEAR = re.compile(r"\b(18\d\d|19\d\d|200\d|201[0-2])\b")
@@ -520,7 +560,7 @@ def is_blank(img):
 
 
 def try_download(cands, save_path, used, words, max_tries=8,
-                 exclude=(), modern=False, need=None):
+                 exclude=(), modern=False, need=None, stats=None):
     if need is None:
         need = 2 if len(words) >= 3 else 1
     ex = [e.lower() for e in exclude if e]
@@ -539,6 +579,8 @@ def try_download(cands, save_path, used, words, max_tries=8,
         scored.append((sc, url))
 
     scored.sort(key=lambda x: -x[0])
+    if stats is not None:
+        stats["pass"] = len(scored)
 
     tries = 0
     for _, url in scored:
@@ -564,22 +606,36 @@ def try_download(cands, save_path, used, words, max_tries=8,
 
 
 def find_photo(queries, save_path, used, key, web_on, anchor,
-               exclude=(), modern=False, relaxed=False):
+               exclude=(), modern=False, relaxed=False, log=None):
     for q in queries:
         words = match_words("" if relaxed else q, anchor)
         sources = []
         if key:
-            sources.append(("Pixabay", lambda q=q: pixabay_urls(q, key)))
+            sources.append(("Pixabay", lambda e, q=q: pixabay_urls(q, key, e)))
+        if not modern:
+            sources.append(("Wikimedia", lambda e, q=q: wikimedia_urls(q, e)))
         if web_on:
-            sources.append(("इंटरनेट", lambda q=q: web_urls(q)))
-        sources.append(("Openverse", lambda q=q: openverse_urls(q)))
+            sources.append(("इंटरनेट", lambda e, q=q: web_urls(q, e)))
+        sources.append(("Openverse", lambda e, q=q: openverse_urls(q, e)))
 
         for name, fetch in sources:
-            if try_download(
-                fetch(), save_path, used, words,
+            errs, stats = [], {}
+            cands = fetch(errs)
+            got = try_download(
+                cands, save_path, used, words,
                 exclude=exclude, modern=modern,
-                need=1 if relaxed else None,
-            ):
+                need=1 if relaxed else None, stats=stats,
+            )
+            if log is not None:
+                line = (
+                    f"'{q}' → {name}: {len(cands)} मिलीं, "
+                    f"{stats.get('pass', 0)} मेल खाईं"
+                    + (" ✅ ली गई" if got else "")
+                )
+                if errs:
+                    line += f" | समस्या: {errs[0]}"
+                log.append(line)
+            if got:
                 return name, q
     return None, None
 
@@ -595,7 +651,7 @@ def guess_modern(*texts):
     ))
 
 
-def ai_image(prompt, save_path, size):
+def ai_image(prompt, save_path, size, err=None):
     """Pollinations से तस्वीर बनवाता है (बिना key)। खाली/ख़राब तस्वीर नकारता है।"""
     if len(prompt.strip()) < 15:
         return False
@@ -634,10 +690,14 @@ def ai_image(prompt, save_path, size):
                     if rgb.width >= 256 and not is_blank(rgb):
                         rgb.save(save_path, "JPEG", quality=92)
                         return True
+                    _note(err, "AI ने खाली/बेकार तस्वीर दी")
                 elif r.status_code == 429:
+                    _note(err, "AI सेवा अभी व्यस्त है (429)")
                     time.sleep(8)
-            except Exception:
-                pass
+                else:
+                    _note(err, f"AI सेवा ने {r.status_code} दिया")
+            except Exception as e:
+                _note(err, f"AI: {type(e).__name__}: {str(e)[:70]}")
         time.sleep(4)
     return False
 
@@ -661,6 +721,54 @@ def make_fallback_image(path, size, pool=None, avoid=None):
         grad = grad.rotate(90, expand=True).resize(size)
     ImageOps.colorize(grad, c1, c2).save(path, "JPEG", quality=90)
     return "रंगीन पृष्ठभूमि"
+
+
+def diagnose_services(pixabay_key=""):
+    """हर बाहरी सेवा को एक छोटे परीक्षण से जाँचता है: [(नाम, ठीक?, विवरण)]"""
+    rows = []
+
+    en = translate_hi_en("नमस्ते दोस्तो")
+    if GoogleTranslator is None:
+        rows.append(("Google अनुवाद", False, "deep-translator इंस्टॉल नहीं है"))
+    else:
+        rows.append(("Google अनुवाद", bool(en.strip()), en[:40] or "जवाब नहीं आया"))
+
+    for name, fn in (
+        ("इंटरनेट खोज", web_urls),
+        ("Wikimedia", wikimedia_urls),
+        ("Openverse", openverse_urls),
+    ):
+        errs = []
+        res = fn("Babylon Ishtar Gate", errs)
+        rows.append((name, len(res) > 0,
+                     f"{len(res)} मिलीं" + (f" | {errs[0]}" if errs else "")))
+
+    if pixabay_key:
+        errs = []
+        res = pixabay_urls("Babylon", pixabay_key, errs)
+        rows.append(("Pixabay", len(res) > 0,
+                     f"{len(res)} मिलीं" + (f" | {errs[0]}" if errs else "")))
+
+    try:
+        r = requests.get(
+            "https://text.pollinations.ai/" + quote("Say hello in one word"),
+            headers=HEADERS, timeout=30,
+        )
+        rows.append(("AI लेखन (Pollinations)",
+                     r.status_code == 200 and bool(r.text.strip()),
+                     f"जवाब कोड {r.status_code}"))
+    except Exception as e:
+        rows.append(("AI लेखन (Pollinations)", False, str(e)[:80]))
+
+    errs = []
+    tmp = os.path.join(tempfile.gettempdir(), "ravi_diag.jpg")
+    t0 = time.time()
+    ok = ai_image(
+        "A beautiful ancient city wall at sunrise, wide photograph", tmp, (512, 512), errs
+    )
+    rows.append(("AI तस्वीर (Pollinations)", ok,
+                 f"{time.time() - t0:.0f} सेकंड" + (f" | {errs[-1]}" if errs else "")))
+    return rows
 
 # ---------------------------------------------------------------- आवाज़
 def voice_params(text, speed_pct, natural):
@@ -1250,6 +1358,7 @@ def draft_job(P, cfg):
                 save_project(P)
                 continue
 
+            log, ai_err = [], []
             plan = plans[i] if i < len(plans) else None
             english = ""
             exclude = []
@@ -1265,7 +1374,7 @@ def draft_job(P, cfg):
 
             source, query = find_photo(
                 queries, path, used, cfg["pixabay_key"], cfg["use_web"],
-                anchor, exclude=exclude, modern=modern,
+                anchor, exclude=exclude, modern=modern, log=log,
             )
 
             if not source and cfg["use_ai"]:
@@ -1274,14 +1383,17 @@ def draft_job(P, cfg):
                     prompt = str(plan["ai"])
                 else:
                     prompt = visual_prompt(sc["text"], topic, anchor, english)
-                if prompt and ai_image(prompt, path, size):
+                if prompt and ai_image(prompt, path, size, ai_err):
                     source, query = "AI", prompt[:120]
+                elif not prompt:
+                    ai_err.append("दृश्य का तस्वीर-विवरण नहीं बन सका")
 
             if not source and anchor:
                 set_state(P, f"विषय से जुड़ी सामान्य तस्वीर खोज रहे हैं: दृश्य {i + 1}")
                 source, query = find_photo(
                     [anchor], path, used, cfg["pixabay_key"], cfg["use_web"],
                     anchor, exclude=exclude, modern=modern, relaxed=True,
+                    log=log,
                 )
 
             if source:
@@ -1295,12 +1407,17 @@ def draft_job(P, cfg):
                 sc.update(image=path, source=label, query="")
                 P.setdefault("missing", []).append(i + 1)
 
+            if ai_err and sc["source"] != "AI":
+                log.append("AI: " + "; ".join(sorted(set(ai_err))))
+            sc["log"] = log
+
             save_project(P)
 
         if P.get("missing"):
             P["note"] = (P.get("note", "") +
                          f" इन दृश्यों की मेल खाती तस्वीर नहीं मिली: {sorted(set(P['missing']))}। "
-                         "इनमें पहले की तस्वीर या रंगीन पृष्ठभूमि लगी है।").strip()
+                         "इनमें पहले की तस्वीर या रंगीन पृष्ठभूमि लगी है। "
+                         "कारण जानने के लिए 'तस्वीर कैसे चुनी गई' खोलें।").strip()
 
         P["draft_done"] = True
         set_state(P, "ड्राफ़्ट तैयार है", 100)
@@ -1512,6 +1629,13 @@ if P is not None:
             )
         resume_clicked = st.button("▶️ वहीं से आगे बढ़ाएँ", type="primary")
 
+    if any(sc.get("log") for sc in P["scenes"]):
+        with st.expander("🔍 तस्वीर कैसे चुनी गई (जाँच)"):
+            for i, sc in enumerate(P["scenes"]):
+                if sc.get("log"):
+                    st.markdown(f"**दृश्य {i + 1}** → {sc.get('source', '')}")
+                    st.code("\n".join(sc["log"]), language=None)
+
     st.divider()
     if st.button("🆕 नया वीडियो बनाएँ"):
         go_new()
@@ -1565,10 +1689,41 @@ use_web = st.checkbox(
 )
 use_ai = st.checkbox("🤖 मेल खाती तस्वीर न मिले तो AI से बनाएँ", value=True)
 
+
+
+def secret(name):
+    """Streamlit के Secrets में एक बार रखी key पढ़ता है (GitHub में नहीं दिखती)।"""
+    try:
+        return str(st.secrets.get(name, "")).strip()
+    except Exception:
+        return ""
+
+
 gemini_key = st.text_input(
     "Google Gemini API key (मुफ़्त; aistudio.google.com से; सबसे सटीक तस्वीरों के लिए)",
     type="password",
+    placeholder="खाली छोड़ें अगर Secrets में सेट है",
 )
+
+
+def secret_names():
+    try:
+        return list(st.secrets.keys())
+    except Exception:
+        return []
+
+
+if not gemini_key.strip():
+    if secret("GEMINI_API_KEY"):
+        gemini_key = secret("GEMINI_API_KEY")
+        st.caption("✅ Gemini key पहले से सेट है (Secrets से), यह खाना खाली रहना सामान्य है।")
+    else:
+        names = ", ".join(secret_names()) or "कोई नहीं"
+        st.caption(
+            "⚠️ Secrets में GEMINI_API_KEY नहीं मिली। Secrets में मिले नाम: "
+            f"{names}। नाम बिल्कुल GEMINI_API_KEY होना चाहिए और key सीधे "
+            "उद्धरण चिह्न \" \" के बीच हो।"
+        )
 if st.button("🔑 key जाँचें"):
     if not gemini_key.strip():
         st.warning("पहले key चिपकाएँ।")
@@ -1581,6 +1736,15 @@ extra_topic = st.text_input(
     placeholder="India vs Australia ODI 2026",
 )
 pixabay_key = st.text_input("Pixabay API key (वैकल्पिक, मुफ़्त)", type="password")
+if not pixabay_key.strip() and secret("PIXABAY_API_KEY"):
+    pixabay_key = secret("PIXABAY_API_KEY")
+    st.caption("✅ Pixabay key पहले से सेट है (Secrets से)।")
+
+if st.button("🧪 सेवाएँ जाँचें (तस्वीर/AI क्यों नहीं मिल रही)"):
+    with st.spinner("हर सेवा जाँची जा रही है... (1-2 मिनट लग सकते हैं)"):
+        rows = diagnose_services(pixabay_key.strip())
+    for name, good, detail in rows:
+        (st.success if good else st.error)(f"{name}: {detail}")
 
 uploaded_images = st.file_uploader(
     "🖼️ अपनी तस्वीरें (पहले दृश्यों में क्रम से लगेंगी)",
