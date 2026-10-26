@@ -1769,7 +1769,80 @@ def set_scene_image(i, newp, source, query):
     sc.update(image=newp, source=source, query=query)
 
 
-def editor():
+def editor():# मौजूदा editor() फंक्शन के अंदर
+# तस्वीर वाले टैब में जोड़ें।
+
+with t1:
+    st.subheader("🖼️ तस्वीर एडिटर")
+
+    if sc.get("image") and os.path.exists(sc["image"]):
+        st.image(sc["image"], use_container_width=True)
+
+    c1, c2 = st.columns(2)
+
+    with c1:
+        if st.button(
+            "🗑️ तस्वीर हटाएँ",
+            key=f"delete_image_{sel}",
+            use_container_width=True
+        ):
+            sc.setdefault("history", []).append(
+                (sc.get("image"), sc.get("source"), sc.get("query"))
+            )
+            sc["image"] = None
+            sc["source"] = "खाली"
+            sc["query"] = ""
+            st.success("तस्वीर हट गई। अब नई तस्वीर लगाएँ।")
+            save_project(P)
+            st.rerun()
+
+    with c2:
+        if st.button(
+            "🤖 AI तस्वीर बनाएँ",
+            key=f"generate_image_{sel}",
+            use_container_width=True
+        ):
+            st.info("नीचे AI तस्वीर बनाने वाला विकल्प इस्तेमाल करें।")
+
+    st.divider()
+
+    uploaded = st.file_uploader(
+        "📁 नई तस्वीर अपलोड करें",
+        type=["jpg", "jpeg", "png", "webp", "heic"],
+        key=f"replace_image_{sel}"
+    )
+
+    if uploaded is not None:
+        signature = hashlib.md5(
+            uploaded.getvalue()
+        ).hexdigest()
+
+        if sc.get("replace_signature") != signature:
+            try:
+                new_path = os.path.join(
+                    P["folder"],
+                    f"replacement_{sel}_{signature[:10]}.jpg"
+                )
+
+                with Image.open(uploaded) as im:
+                    rgb = to_rgb(im)
+                    rgb.thumbnail((2400, 2400))
+                    rgb.save(new_path, "JPEG", quality=92)
+
+                set_scene_image(
+                    sel,
+                    new_path,
+                    "आपकी नई तस्वीर",
+                    uploaded.name
+                )
+
+                sc["replace_signature"] = signature
+                save_project(P)
+                st.success("नई तस्वीर लग गई!")
+                st.rerun()
+
+            except Exception as e:
+                st.error(f"तस्वीर नहीं लग सकी: {e}")
     scenes = P["scenes"]
     n = len(scenes)
     st.subheader("✏️ एडिटर")
