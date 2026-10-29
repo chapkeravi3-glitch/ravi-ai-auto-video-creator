@@ -18,7 +18,7 @@ jobs:
           playwright install --with-deps chromium
       - name: Open the app
         env:
-          APP_URL: "https://आपका-ऐप-नाम.streamlit.app"
+          APP_URL: "https://ravi-ai-auto-video-creator-uxp2mmsrh6lt9rjtckkds5.streamlit.app"
         run: |
           python - <<'PY'
           import os, time
