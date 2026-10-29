@@ -1,0 +1,42 @@
+name: Keep Streamlit app awake
+
+on:
+  schedule:
+    - cron: "0 */6 * * *"
+  workflow_dispatch:
+
+jobs:
+  wake:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install browser
+        run: |
+          pip install playwright
+          playwright install --with-deps chromium
+      - name: Open the app
+        env:
+          APP_URL: "https://आपका-ऐप-नाम.streamlit.app"
+        run: |
+          python - <<'PY'
+          import os, time
+          from playwright.sync_api import sync_playwright
+          url = os.environ["APP_URL"]
+          with sync_playwright() as p:
+              browser = p.chromium.launch()
+              page = browser.new_page()
+              page.goto(url, timeout=120000)
+              time.sleep(10)
+              btn = page.get_by_text("Yes, get this app back up!")
+              if btn.count():
+                  btn.first.click()
+                  print("ऐप सो रहा था, जगा दिया")
+                  time.sleep(60)
+              else:
+                  print("ऐप पहले से जागा हुआ है")
+                  time.sleep(30)
+              print("पेज का शीर्षक:", page.title())
+              browser.close()
+          PY
