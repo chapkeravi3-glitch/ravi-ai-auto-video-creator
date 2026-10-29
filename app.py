@@ -72,7 +72,10 @@ FORMATS = {
     "Square (1:1)": (720, 720)
 }
 
-EFFECTS = ["Zoom In", "Zoom Out", "Pan Left to Right", "Pan Right to Left"]
+EFFECTS = [
+    "Zoom In", "Zoom Out", "Pan Left to Right", "Pan Right to Left",
+    "Pan Up", "Pan Down", "Drift Zoom", "Handheld",
+]
 
 TRANSITIONS = [
     "fade", "slideleft", "wipeleft", "circleopen", "dissolve",
@@ -86,7 +89,7 @@ PAD = 0.35     # दृश्य के अंत में ठहराव
 TRANS = 0.5    # दृश्यों के बीच ट्रांज़िशन की अवधि
 GEMINI_MODELS = ["gemini-3.5-flash", "gemini-3.5-flash-lite", "gemini-3-flash-preview"]
 HEADERS = {"User-Agent": "RaviAIVideoCreator/6.0 (personal video project)"}
-APP_VERSION = "Ravi Studio • संस्करण 8"
+APP_VERSION = "Ravi Studio • संस्करण 9"
 
 CAPTION_SIZES = {"छोटा": 0.050, "मध्यम": 0.066, "बड़ा": 0.082}
 
@@ -1395,26 +1398,40 @@ def write_ass(path, cues, size, font_path, size_ratio, lead,
 ZOOM = 1.22  # अधिकतम ज़ूम
 
 
+def _motion(effect, e, t):
+    """(z, x, y) व्यंजक। e = 0..1 की चिकनी प्रगति, t = फ़्रेम गिनती।"""
+    cx = "iw/2-(iw/zoom/2)"
+    cy = "ih/2-(ih/zoom/2)"
+    rx = "(iw-iw/zoom)"
+    ry = "(ih-ih/zoom)"
+    if effect == "Static":
+        return "1.0", "0", "0"
+    if effect == "Zoom Out":
+        return f"{ZOOM}-{ZOOM - 1}*{e}", cx, cy
+    if effect == "Pan Left to Right":
+        return f"{ZOOM}", f"{rx}*{e}", f"{ry}/2"
+    if effect == "Pan Right to Left":
+        return f"{ZOOM}", f"{rx}*(1-{e})", f"{ry}/2"
+    if effect == "Pan Up":
+        return f"{ZOOM}", f"{rx}/2", f"{ry}*(1-{e})"
+    if effect == "Pan Down":
+        return f"{ZOOM}", f"{rx}/2", f"{ry}*{e}"
+    if effect == "Drift Zoom":
+        return f"1+0.18*{e}", f"{rx}*(0.25+0.5*{e})", f"{ry}*(0.6-0.3*{e})"
+    if effect == "Handheld":
+        return (
+            "1.12",
+            f"{rx}/2+iw*0.006*sin({t}/7)",
+            f"{ry}/2+ih*0.006*cos({t}/9)",
+        )
+    return f"1+{ZOOM - 1}*{e}", cx, cy  # Zoom In
+
+
 def motion_filter(effect, frames, w, h):
     # धीमी शुरुआत और धीमा अंत (ease in-out), ताकि हलचल सिनेमा जैसी लगे
     p = f"(on/{frames})"
     e = f"({p}*{p}*(3-2*{p}))"
-    cx = "iw/2-(iw/zoom/2)"
-    cy = "ih/2-(ih/zoom/2)"
-
-    if effect == "Zoom Out":
-        z, x, y = f"{ZOOM}-{ZOOM - 1}*{e}", cx, cy
-    elif effect == "Pan Left to Right":
-        z = f"{ZOOM}"
-        x = f"(iw-iw/zoom)*{e}"
-        y = "(ih-ih/zoom)/2"
-    elif effect == "Pan Right to Left":
-        z = f"{ZOOM}"
-        x = f"(iw-iw/zoom)*(1-{e})"
-        y = "(ih-ih/zoom)/2"
-    else:  # Zoom In
-        z, x, y = f"1+{ZOOM - 1}*{e}", cx, cy
-
+    z, x, y = _motion(effect, e, "on")
     return (
         f"zoompan=z='{z}':x='{x}':y='{y}':"
         f"d={frames}:s={w}x{h}:fps={FPS}"
@@ -1423,18 +1440,7 @@ def motion_filter(effect, frames, w, h):
 
 def end_state_filter(effect, w, h):
     """पिछले क्लिप की आख़िरी झलक (ताकि ट्रांज़िशन में झटका न लगे)।"""
-    cx = "iw/2-(iw/zoom/2)"
-    cy = "ih/2-(ih/zoom/2)"
-
-    if effect == "Zoom Out":
-        z, x, y = "1.0", "0", "0"
-    elif effect == "Pan Left to Right":
-        z, x, y = f"{ZOOM}", "iw-iw/zoom", "(ih-ih/zoom)/2"
-    elif effect == "Pan Right to Left":
-        z, x, y = f"{ZOOM}", "0", "(ih-ih/zoom)/2"
-    else:
-        z, x, y = f"{ZOOM}", cx, cy
-
+    z, x, y = _motion(effect, "1", "0")
     return (
         f"zoompan=z='{z}':x='{x}':y='{y}':d=1:s={w}x{h}:fps={FPS}"
     )
@@ -1453,19 +1459,28 @@ def compose(src, k, ww, hh):
 
 def make_clip(image, prev, prev_effect, audio, voice_len, cues, out, size,
               effect, transition, ffmpeg, font, size_ratio, folder,
-              pad, is_last, title="", title_style="pop", title_pos="top"):
+              pad, is_last, title="", title_style="pop", title_pos="top", video=None):
     w, h = size
     total = LEAD + voice_len + pad
     frames = max(1, math.ceil(total * FPS))
     k = 1.5 if max(w, h) <= 1300 else 1.3
     bw, bh = int(w * k) // 2 * 2, int(h * k) // 2 * 2
 
-    cmd = [ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-i", image]
-    graph = [
-        compose("0:v", "0", bw, bh),
-        f"[c0]{motion_filter(effect, frames, w, h)},"
-        f"fps={FPS},setsar=1,format=yuv420p[cur]",
-    ]
+    if video:
+        # अपना वीडियो-क्लिप: ज़रूरत हो तो दोहराकर दृश्य की लंबाई तक चलाएँ
+        cmd = [ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
+               "-stream_loop", "-1", "-i", video]
+        graph = [
+            compose("0:v", "0", w, h),
+            f"[c0]fps={FPS},setsar=1,format=yuv420p[cur]",
+        ]
+    else:
+        cmd = [ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-i", image]
+        graph = [
+            compose("0:v", "0", bw, bh),
+            f"[c0]{motion_filter(effect, frames, w, h)},"
+            f"fps={FPS},setsar=1,format=yuv420p[cur]",
+        ]
 
     if prev:
         cmd += [
@@ -1901,6 +1916,8 @@ def resolve_effects(kept, off, default_effect, default_transition):
         e = sc["effect"] if sc["effect"] != "Default" else default_effect
         if e.startswith("Auto"):
             e = EFFECTS[(idx + off) % len(EFFECTS)]
+        if sc.get("video"):
+            e = "Static"  # अपने वीडियो पर ज़ूम नहीं लगता
         t = sc["transition"] if sc["transition"] != "Default" else default_transition
         if t.startswith("Auto"):
             t = TRANSITIONS[(idx * 5 + off) % len(TRANSITIONS)]
@@ -1919,7 +1936,7 @@ def preview_clip(P, sel, size, default_effect, default_transition, captions, cap
         kept, P.get("offset", 0), default_effect, default_transition
     )
     sc = kept[pos]
-    prev = kept[pos - 1]["image"] if pos > 0 else None
+    prev = (kept[pos - 1].get("end_image") or kept[pos - 1]["image"]) if pos > 0 else None
     prev_eff = effects[pos - 1] if pos > 0 else None
     font = get_caption_font() if captions else None
     out = os.path.join(P["folder"], f"preview_{int(time.time() * 1000) % 10**9}.mp4")
@@ -1929,7 +1946,7 @@ def preview_clip(P, sel, size, default_effect, default_transition, captions, cap
         ffmpeg, font, cap_ratio, P["folder"], sc["pad"], False,
         title=(sc.get("title") or "").strip(),
         title_style=sc.get("title_style", "pop"),
-        title_pos=sc.get("title_pos", "top"),
+        title_pos=sc.get("title_pos", "top"), video=sc.get("video"),
     )
     return out
 
@@ -1961,7 +1978,7 @@ def render_job(P, cfg):
 
         plan_jobs = []
         for idx, sc in enumerate(kept):
-            prev = kept[idx - 1]["image"] if idx > 0 else None
+            prev = (kept[idx - 1].get("end_image") or kept[idx - 1]["image"]) if idx > 0 else None
             prev_eff = effects[idx - 1] if idx > 0 else None
             title = (sc.get("title") or "").strip()
             sig = repr((
@@ -1971,6 +1988,8 @@ def render_job(P, cfg):
                 sc["cues"] if font else None, font, size,
                 cfg["cap_ratio"], sc["pad"], idx == n - 1,
                 title, sc.get("title_style"), sc.get("title_pos"),
+                sc.get("video"),
+                os.path.getmtime(sc["video"]) if sc.get("video") and os.path.exists(sc["video"]) else 0,
             ))
             key = hashlib.md5(sig.encode()).hexdigest()[:16]
             plan_jobs.append({
@@ -1991,7 +2010,7 @@ def render_job(P, cfg):
                 size, j["effect"], j["trans"], ffmpeg, font,
                 cfg["cap_ratio"], folder, sc["pad"], j["idx"] == n - 1,
                 title=j["title"], title_style=sc.get("title_style", "pop"),
-                title_pos=sc.get("title_pos", "top"),
+                title_pos=sc.get("title_pos", "top"), video=sc.get("video"),
             )
             os.replace(tmp, j["clip"])
 
@@ -2025,10 +2044,15 @@ def render_job(P, cfg):
         join_clips(clips, folder, joined, ffmpeg)
 
         final = joined
-        if cfg.get("music"):
+        if cfg.get("music") and os.path.exists(cfg["music"]):
             set_state(P, "पृष्ठभूमि संगीत जोड़ा जा रहा है...", 96)
             final = os.path.join(folder, f"video_{stamp}_music.mp4")
-            add_music(joined, cfg["music"], final, cfg["music_vol"], ffmpeg)
+            try:
+                add_music(joined, cfg["music"], final, cfg["music_vol"], ffmpeg)
+            except Exception as e:
+                final = joined
+                P["note"] = ("संगीत जुड़ नहीं सका, इसलिए वीडियो बिना संगीत के बना। कारण: "
+                             + str(e)[-200:])
 
         P["video"] = final
         publish_static(P, final)
@@ -2086,6 +2110,85 @@ def new_scene(P, text, image, source="आपकी तस्वीर", query=""
     }
 
 
+def import_voice(P, src_path, text):
+    """अपनी रिकॉर्ड/अपलोड की आवाज़ को दृश्य की आवाज़ बनाने के लिए तैयार करता है।"""
+    ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+    uid = int(time.time() * 1000) % 10**9
+    out = os.path.join(P["folder"], f"voice_own_{uid}.mp3")
+    subprocess.run(
+        [ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-i", src_path,
+         "-vn", "-ac", "1", "-ar", "24000", "-q:a", "4", out],
+        check=True, capture_output=True, timeout=300,
+    )
+    vlen = audio_duration(out, ffmpeg)
+    return out, vlen, build_cues(text, [], vlen)
+
+
+def import_video(P, src_path, text="", start=0.0, length=60.0, keep_audio=True):
+    """अपना वीडियो-क्लिप एक नए दृश्य की तरह तैयार करता है।"""
+    ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+    uid = int(time.time() * 1000) % 10**9
+    folder = P["folder"]
+    length = max(1.0, min(float(length), 180.0))
+    norm = os.path.join(folder, f"vid_{uid}.mp4")
+    r = subprocess.run(
+        [ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
+         "-ss", str(max(0.0, start)), "-t", str(length), "-i", src_path, "-an",
+         "-vf", "scale='min(1280,iw)':-2,fps=24,format=yuv420p",
+         "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", norm],
+        capture_output=True, text=True, timeout=900,
+    )
+    if r.returncode != 0 or not os.path.exists(norm):
+        raise RuntimeError("यह वीडियो खुल नहीं सका: " + r.stderr[-200:])
+    vdur = audio_duration(norm, ffmpeg)
+
+    thumb = os.path.join(folder, f"vthumb_{uid}.jpg")
+    endf = os.path.join(folder, f"vend_{uid}.jpg")
+    subprocess.run(
+        [ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
+         "-ss", str(vdur / 2), "-i", norm, "-frames:v", "1", thumb],
+        capture_output=True, timeout=120,
+    )
+    subprocess.run(
+        [ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
+         "-sseof", "-0.3", "-i", norm, "-frames:v", "1", endf],
+        capture_output=True, timeout=120,
+    )
+    if not os.path.exists(thumb):
+        make_fallback_image(thumb, P.get("size", (720, 1280)), [], None, title="VIDEO")
+    if not os.path.exists(endf):
+        shutil.copy(thumb, endf)
+
+    text = (text or "").strip()
+    vp = os.path.join(folder, f"voice_vid_{uid}.mp3")
+    if text:
+        rate, pitch = voice_params(text, P.get("speed", -5), P.get("natural", True))
+        bounds = asyncio.run(synth(text, P["voice"], vp, rate, pitch))
+        vlen = audio_duration(vp, ffmpeg)
+        cues = build_cues(text, bounds, vlen)
+    else:
+        vlen, cues = vdur, []
+        got_audio = False
+        if keep_audio:
+            r2 = subprocess.run(
+                [ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
+                 "-ss", str(max(0.0, start)), "-t", str(length), "-i", src_path,
+                 "-vn", "-ac", "1", "-ar", "24000", "-q:a", "4", vp],
+                capture_output=True, timeout=300,
+            )
+            got_audio = r2.returncode == 0 and os.path.exists(vp)
+        if not got_audio:
+            make_silent_audio(vp, vdur, ffmpeg)
+
+    return {
+        "text": text or "(आपका वीडियो-क्लिप)", "voice_path": vp, "voice_len": vlen,
+        "cues": cues, "pad": 0.2, "image": thumb, "end_image": endf, "video": norm,
+        "source": "आपका वीडियो", "query": "", "effect": "Default",
+        "transition": "Default", "keep": True, "title": "", "title_style": "pop",
+        "title_pos": "top", "log": [],
+    }
+
+
 def start_thread(fn, P, cfg):
     t = threading.Thread(target=fn, args=(P, cfg), daemon=True)
     t.start()
@@ -2103,6 +2206,10 @@ EFFECT_NAMES = {
     "Zoom Out": "धीरे-धीरे दूर जाना (Zoom Out)",
     "Pan Left to Right": "बाएँ से दाएँ घूमना (Pan →)",
     "Pan Right to Left": "दाएँ से बाएँ घूमना (Pan ←)",
+    "Pan Up": "नीचे से ऊपर उठना (Pan ↑)",
+    "Pan Down": "ऊपर से नीचे उतरना (Pan ↓)",
+    "Drift Zoom": "तिरछा बहता ज़ूम (Drift)",
+    "Handheld": "हाथ में कैमरा जैसी हल्की हलचल",
 }
 TRANS_NAMES = {
     "Default": "सेटिंग वाला (डिफ़ॉल्ट)",
@@ -2625,12 +2732,18 @@ elif page == "🎞️ एडिटर":
 
         tab = st.radio(
             "क्या बदलना है?",
-            ["🖼️ फोटो", "✨ एनिमेशन", "🔠 टाइटल", "📝 शब्द/आवाज़", "🧩 दृश्य"],
+            ["🖼️ फोटो", "✨ एनिमेशन", "🔠 टाइटल", "📝 शब्द/आवाज़", "🎵 संगीत", "🧩 दृश्य"],
             horizontal=True, key="etab", label_visibility="collapsed",
         )
 
         # ============ फोटो
         if tab == "🖼️ फोटो":
+            if sc.get("video"):
+                st.info("🎬 यह आपका वीडियो-क्लिप वाला दृश्य है। नीचे फोटो लगाने पर यह वीडियो हट जाएगा।")
+                if st.button("📷 वीडियो हटाकर फोटो वाला दृश्य बनाएँ", key=f"vrm_{sel}"):
+                    sc["video"] = None
+                    sc["end_image"] = None
+                    st.rerun()
             a1, a2 = st.columns(2)
             if a1.button("🗑️ यह फोटो हटाएँ", key=f"rm_{sel}", use_container_width=True):
                 ph = os.path.join(P["folder"], f"scene_{sel}_blank_{int(time.time() * 1000) % 10**9}.jpg")
@@ -2786,6 +2899,8 @@ elif page == "🎞️ एडिटर":
 
         # ============ एनिमेशन
         elif tab == "✨ एनिमेशन":
+            if sc.get("video"):
+                st.info("🎬 वीडियो-क्लिप पर ज़ूम/पैन नहीं लगता। इस दृश्य में आते समय का ट्रांज़िशन चुन सकते हैं।")
             fx_keys = list(EFFECT_NAMES.keys())
             tr_keys = list(TRANS_NAMES.keys())
             sc["keep"] = st.checkbox("इस दृश्य को वीडियो में रखें", sc["keep"], key=f"keep_{sel}")
@@ -2881,6 +2996,79 @@ elif page == "🎞️ एडिटर":
                         st.error(f"आवाज़ नहीं बन सकी: {e}")
             st.caption("शब्द बदलने पर नई आवाज़ और कैप्शन दोनों बनते हैं।")
 
+            st.markdown("**🎤 अपनी आवाज़ लगाएँ (AI आवाज़ की जगह)**")
+            own_src = None
+            if hasattr(st, "audio_input"):
+                rec = st.audio_input("🎙️ यहीं रिकॉर्ड करें", key=f"rec_{sel}")
+                if rec is not None:
+                    own_src = ("record", rec)
+            upv = st.file_uploader("या अपनी आवाज़ की फ़ाइल चुनें (mp3/wav/m4a)", key=f"vup_{sel}")
+            if upv is not None:
+                own_src = ("file", upv)
+            if own_src is not None:
+                sig = f"{own_src[0]}-{getattr(own_src[1], 'name', '')}-{getattr(own_src[1], 'size', 0)}"
+                st.audio(own_src[1])
+                if st.button("✅ इसे इस दृश्य की आवाज़ बनाएँ", key=f"ownv_{sel}", type="primary"):
+                    try:
+                        tmpf = os.path.join(P["folder"], f"own_in_{int(time.time() * 1000) % 10**9}")
+                        with open(tmpf, "wb") as f:
+                            f.write(own_src[1].getbuffer())
+                        with st.spinner("आवाज़ तैयार हो रही है..."):
+                            vp, vlen, cues = import_voice(P, tmpf, sc["text"])
+                        sc.update(voice_path=vp, voice_len=vlen, cues=cues, own_voice=True)
+                        st.session_state["flash"] = f"✅ दृश्य {sel + 1} में आपकी आवाज़ लग गई"
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"आवाज़ नहीं लग सकी: {str(e)[-200:]}")
+            if sc.get("own_voice"):
+                st.caption("इस दृश्य में अभी आपकी अपनी आवाज़ है। कैप्शन का समय अंदाज़े से बैठता है।")
+                if st.button("↩️ AI आवाज़ पर लौटें", key=f"aiv_{sel}"):
+                    try:
+                        ff = imageio_ffmpeg.get_ffmpeg_exe()
+                        vp = os.path.join(P["folder"], f"voice_back_{sel}_{int(time.time())}.mp3")
+                        rate, pitch = voice_params(sc["text"], P["speed"], P["natural"])
+                        with st.spinner("AI आवाज़ बन रही है..."):
+                            bounds = asyncio.run(synth(sc["text"], P["voice"], vp, rate, pitch))
+                        vlen = audio_duration(vp, ff)
+                        sc.update(voice_path=vp, voice_len=vlen, own_voice=False,
+                                  cues=build_cues(sc["text"], bounds, vlen))
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"आवाज़ नहीं बन सकी: {e}")
+
+        # ============ संगीत
+        elif tab == "🎵 संगीत":
+            st.markdown("**🎵 पूरे वीडियो का पृष्ठभूमि संगीत**")
+            cur_music = P.get("music")
+            if cur_music and os.path.exists(cur_music):
+                st.success(f"✅ संगीत लगा है: {os.path.basename(cur_music)[:40]}")
+                st.audio(cur_music)
+            else:
+                st.info("अभी कोई संगीत नहीं लगा है।")
+            mus_up = st.file_uploader("संगीत की फ़ाइल चुनें (mp3 / wav / m4a)", key="music_up")
+            if mus_up is not None:
+                sig = f"{mus_up.name}-{mus_up.size}"
+                if P.get("music_sig") != sig:
+                    try:
+                        mp = os.path.join(P["folder"], "music_" + re.sub(r"[^A-Za-z0-9._-]", "_", mus_up.name))
+                        with open(mp, "wb") as f:
+                            f.write(mus_up.getbuffer())
+                        P["music"], P["music_sig"] = mp, sig
+                        save_project(P)
+                        st.session_state["flash"] = "✅ संगीत जुड़ गया, अब 'वीडियो बनाएँ' दबाएँ"
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"संगीत सहेजा नहीं जा सका: {e}")
+            P["music_vol"] = st.slider(
+                "संगीत की आवाज़ (आवाज़ के नीचे धीमा रहे)", 0.03, 0.40,
+                float(P.get("music_vol", 0.12)), 0.01, key="music_vol",
+            )
+            if cur_music and st.button("🗑️ संगीत हटाएँ", key="music_rm"):
+                P["music"], P["music_sig"] = None, None
+                st.rerun()
+            st.caption("संगीत वीडियो बनाते समय जुड़ता है। बदलाव के बाद नीचे 'वीडियो बनाएँ' ज़रूर दबाएँ। "
+                       "संगीत छोटा हो तो अपने आप दोहराया जाता है।")
+
         # ============ दृश्य (क्रम, दोहराना, जोड़ना, हटाना)
         else:
             m1, m2 = st.columns(2)
@@ -2927,6 +3115,31 @@ elif page == "🎞️ एडिटर":
                     except Exception as e:
                         st.error(f"दृश्य नहीं जुड़ा: {str(e)[-300:]}")
 
+            with st.expander("🎬 अपना वीडियो-क्लिप जोड़ें (इसके बाद)"):
+                vid_up = st.file_uploader("वीडियो चुनें (mp4/mov वगैरह)", key=f"vidup_{sel}")
+                v1, v2 = st.columns(2)
+                v_start = v1.number_input("कहाँ से शुरू (सेकंड)", 0.0, 3600.0, 0.0, 1.0, key=f"vst_{sel}")
+                v_len = v2.number_input("कितने सेकंड लेने हैं", 1.0, 180.0, 30.0, 1.0, key=f"vln_{sel}")
+                v_text = st.text_area(
+                    "बोले जाने वाले शब्द (खाली = वीडियो की अपनी आवाज़)", key=f"vtx_{sel}", height=80
+                )
+                if st.button("➕ वीडियो-क्लिप जोड़ें", key=f"vadd_{sel}", type="primary") and vid_up is not None:
+                    try:
+                        srcp = os.path.join(P["folder"], f"vin_{int(time.time() * 1000) % 10**9}")
+                        with open(srcp, "wb") as f:
+                            f.write(vid_up.getbuffer())
+                        with st.spinner("वीडियो तैयार हो रहा है (कुछ सेकंड से मिनट)..."):
+                            vs = import_video(P, srcp, v_text, v_start, v_len, True)
+                        scenes.insert(sel + 1, vs)
+                        os.remove(srcp)
+                        st.session_state["_sel_next"] = sel + 1
+                        st.session_state["flash"] = "✅ आपका वीडियो-क्लिप नए दृश्य की तरह जुड़ गया"
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"वीडियो नहीं जुड़ा: {str(e)[-250:]}")
+                elif vid_up is None:
+                    st.caption("पहले वीडियो चुनें, फिर '➕ वीडियो-क्लिप जोड़ें' दबाएँ।")
+
             with st.expander("🗑️ यह दृश्य हमेशा के लिए हटाएँ"):
                 sure = st.checkbox("हाँ, इस दृश्य को हटाना है", key=f"sure_{sel}")
                 if st.button("🗑️ हटाएँ", key=f"delsc_{sel}", disabled=(not sure) or n <= 1):
@@ -2939,8 +3152,11 @@ elif page == "🎞️ एडिटर":
         # ============ वीडियो बनाना
         st.divider()
         st.markdown("**🎬 वीडियो तैयार करें**")
-        music_file = st.file_uploader("🎵 पृष्ठभूमि संगीत (वैकल्पिक)", key="music_up")
-        music_vol = st.slider("संगीत की आवाज़", 0.03, 0.40, 0.12, 0.01, key="music_vol")
+        _m = P.get("music")
+        if _m and os.path.exists(_m):
+            st.caption(f"🎵 संगीत लगेगा: {os.path.basename(_m)[:40]}")
+        else:
+            st.caption("🎵 संगीत नहीं लगा है। जोड़ने के लिए ऊपर '🎵 संगीत' चुनें।")
         fast_mode = st.checkbox(
             "⚡ तेज़ झलक (480p, जल्दी बनता है; अंतिम वीडियो के लिए इसे बंद रखें)", value=False,
             key="fast_mode",
@@ -2950,13 +3166,8 @@ elif page == "🎞️ एडिटर":
             "🔄 बदलावों के साथ दोबारा बनाएँ" if rendered else "🎬 वीडियो बनाएँ",
             type="primary", use_container_width=True, disabled=busy_any,
         ):
-            music_path = None
-            if music_file is not None:
-                music_path = os.path.join(
-                    P["folder"], "music_" + os.path.basename(music_file.name)
-                )
-                with open(music_path, "wb") as f:
-                    f.write(music_file.getbuffer())
+            music_path = P.get("music")
+            music_vol = float(P.get("music_vol", 0.12))
             P.update(state="rendering", progress=0, status="शुरू हो रहा है...",
                      error="", video=None, cancel=False, heartbeat=time.time())
             P["note"] = ""
