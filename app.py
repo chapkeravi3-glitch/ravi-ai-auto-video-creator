@@ -11,6 +11,8 @@ import io
 import math
 import shutil
 import time
+import threading
+import base64
 import hashlib
 from urllib.parse import quote
 from PIL import Image, ImageFont, ImageOps, ImageStat
@@ -84,7 +86,7 @@ PAD = 0.35     # दृश्य के अंत में ठहराव
 TRANS = 0.5    # दृश्यों के बीच ट्रांज़िशन की अवधि
 GEMINI_MODELS = ["gemini-3.5-flash", "gemini-3.5-flash-lite", "gemini-3-flash-preview"]
 HEADERS = {"User-Agent": "RaviAIVideoCreator/6.0 (personal video project)"}
-APP_VERSION = "Ravi Studio • संस्करण 7"
+APP_VERSION = "Ravi Studio • संस्करण 8"
 
 CAPTION_SIZES = {"छोटा": 0.050, "मध्यम": 0.066, "बड़ा": 0.082}
 
@@ -451,7 +453,7 @@ def _note(err, msg):
         err.append(msg)
 
 
-def pixabay_urls(query, key, err=None):
+def pixabay_urls(query, key, err=None, latest=False):
     lang = "hi" if re.search(r"[\u0900-\u097F]", query) else "en"
     try:
         r = requests.get(
@@ -459,6 +461,7 @@ def pixabay_urls(query, key, err=None):
             params={
                 "key": key, "q": query[:100], "lang": lang,
                 "image_type": "photo", "per_page": 30, "safesearch": "true",
+                "order": "latest" if latest else "popular",
             },
             headers=HEADERS, timeout=25,
         )
@@ -473,16 +476,79 @@ def pixabay_urls(query, key, err=None):
         return []
 
 
-def web_urls(query, err=None):
+def web_urls(query, err=None, timelimit=None):
+    """इंटरनेट की तस्वीरें; timelimit: d=24 घंटे, w=हफ़्ता, m=महीना, y=साल।"""
     if DDGS is None:
         _note(err, "इंटरनेट खोज की लाइब्रेरी (ddgs) इंस्टॉल नहीं है")
         return []
     try:
         with DDGS() as d:
-            results = list(d.images(query, max_results=25))
+            try:
+                results = list(d.images(query, max_results=25, timelimit=timelimit or None))
+            except TypeError:
+                results = list(d.images(query, max_results=25))
         return [(r.get("image"), r.get("title", "")) for r in results]
     except Exception as e:
         _note(err, f"इंटरनेट खोज: {type(e).__name__}: {str(e)[:90]}")
+        return []
+
+
+def ddg_news_urls(query, err=None, timelimit=None):
+    """ताज़ा समाचारों की मुख्य तस्वीरें (शीर्षक+विवरण के साथ, इसलिए मेल जाँचना आसान)।"""
+    if DDGS is None:
+        _note(err, "इंटरनेट खोज की लाइब्रेरी (ddgs) इंस्टॉल नहीं है")
+        return []
+    try:
+        with DDGS() as d:
+            try:
+                res = list(d.news(query, max_results=15, timelimit=timelimit or None))
+            except TypeError:
+                res = list(d.news(query, max_results=15))
+        out = []
+        for r in res:
+            img = r.get("image")
+            if img:
+                out.append((img, f"{r.get('title', '')} {r.get('body', '')}"))
+        return out
+    except Exception as e:
+        _note(err, f"समाचार-फोटो: {type(e).__name__}: {str(e)[:90]}")
+        return []
+
+
+BING_INTERVAL = {"d": "7", "w": "8", "m": "9"}
+
+
+def bing_news_urls(query, err=None, timelimit=None):
+    """Bing News की RSS से ताज़ा समाचारों की तस्वीरें (बिना key, बिना लाइब्रेरी)।"""
+    import xml.etree.ElementTree as ET
+    params = {"q": query, "format": "rss", "setmkt": "en-IN", "count": 20}
+    if timelimit in BING_INTERVAL:
+        params["qft"] = f'interval="{BING_INTERVAL[timelimit]}"'
+    try:
+        r = requests.get(
+            "https://www.bing.com/news/search",
+            params=params, headers=HEADERS, timeout=25,
+        )
+        r.raise_for_status()
+        root = ET.fromstring(r.content)
+        out = []
+        for item in root.iter("item"):
+            title = item.findtext("title") or ""
+            desc = item.findtext("description") or ""
+            img = None
+            for el in item.iter():
+                if el.tag.endswith("Image") and (el.text or "").strip():
+                    img = el.text.strip()
+                    break
+            if not img:
+                continue
+            img = img.replace("http://", "https://")
+            if "bing.com/th" in img and "w=" not in img:
+                img += "&w=1280&h=800&c=7&rs=1"
+            out.append((img, f"{title} {desc}"))
+        return out
+    except Exception as e:
+        _note(err, f"Bing समाचार: {type(e).__name__}: {str(e)[:90]}")
         return []
 
 
@@ -506,7 +572,7 @@ def openverse_urls(query, err=None):
         return []
 
 
-def wikimedia_urls(query, err=None):
+def wikimedia_urls(query, err=None, recent_years=None):
     """ऐतिहासिक विषयों (जगह, राजा, इमारत) के लिए बहुत अच्छा स्रोत।"""
     params = {
         "action": "query", "format": "json", "generator": "search",
@@ -514,6 +580,9 @@ def wikimedia_urls(query, err=None):
         "prop": "imageinfo", "iiprop": "url|mime|extmetadata",
         "iiurlwidth": 1600,
     }
+    if recent_years:
+        params["gsrsort"] = "create_timestamp_desc"
+    min_year = time.localtime().tm_year - int(recent_years or 0)
     for attempt in range(2):
         try:
             r = requests.get(
@@ -532,6 +601,14 @@ def wikimedia_urls(query, err=None):
                     continue
                 url = info.get("thumburl") or info.get("url")
                 meta = info.get("extmetadata") or {}
+                if recent_years:
+                    stamp = (
+                        (meta.get("DateTimeOriginal") or meta.get("DateTime") or {})
+                        .get("value", "")
+                    )
+                    ym = re.search(r"(?:19|20)\d\d", stamp)
+                    if not ym or int(ym.group(0)) < min_year:
+                        continue  # तारीख़ पता नहीं या पुरानी: नहीं लेंगे
                 desc = re.sub(
                     r"<[^>]+>", " ",
                     (meta.get("ImageDescription") or {}).get("value", ""),
@@ -609,25 +686,49 @@ def try_download(cands, save_path, used, words, max_tries=8,
     return False
 
 
+WIKI_YEARS = {"d": 1, "w": 1, "m": 1, "y": 2}
+
+
+def widen(tl):
+    """ताज़ा तस्वीर न मिले तो समय-सीमा धीरे-धीरे बढ़ाएँ।"""
+    order = ["d", "w", "m", "y"]
+    if tl in order:
+        return order[order.index(tl):]
+    return [tl or ""]
+
+
+def make_sources(query, px_key, web_on, tl):
+    """tl खाली = ऐतिहासिक विषय; वरना ताज़ा तस्वीरों वाले स्रोत।"""
+    srcs = []
+    if tl:
+        srcs.append(("Bing समाचार", lambda e: bing_news_urls(query, e, tl)))
+        if web_on:
+            srcs.append(("समाचार-फोटो", lambda e: ddg_news_urls(query, e, tl)))
+            srcs.append(("इंटरनेट (ताज़ा)", lambda e: web_urls(query, e, tl)))
+        srcs.append(("Wikimedia (नई)", lambda e: wikimedia_urls(query, e, WIKI_YEARS.get(tl, 2))))
+        if px_key:
+            srcs.append(("Pixabay (नई)", lambda e: pixabay_urls(query, px_key, e, latest=True)))
+    else:
+        if px_key:
+            srcs.append(("Pixabay", lambda e: pixabay_urls(query, px_key, e)))
+        srcs.append(("Wikimedia", lambda e: wikimedia_urls(query, e)))
+        if web_on:
+            srcs.append(("इंटरनेट", lambda e: web_urls(query, e)))
+        srcs.append(("Openverse", lambda e: openverse_urls(query, e)))
+    return srcs
+
+
 def find_photo(queries, save_path, used, key, web_on, anchor,
-               exclude=(), modern=False, relaxed=False, log=None):
+               exclude=(), modern=False, relaxed=False, log=None, timelimit=None):
+    tl = timelimit if timelimit is not None else ("y" if modern else "")
     for q in queries:
         words = match_words("" if relaxed else q, anchor)
-        sources = []
-        if key:
-            sources.append(("Pixabay", lambda e, q=q: pixabay_urls(q, key, e)))
-        if not modern:
-            sources.append(("Wikimedia", lambda e, q=q: wikimedia_urls(q, e)))
-        if web_on:
-            sources.append(("इंटरनेट", lambda e, q=q: web_urls(q, e)))
-        sources.append(("Openverse", lambda e, q=q: openverse_urls(q, e)))
-
-        for name, fetch in sources:
+        for name, fetch in make_sources(q, key, web_on, tl):
             errs, stats = [], {}
             cands = fetch(errs)
             got = try_download(
                 cands, save_path, used, words,
-                exclude=exclude, modern=modern,
+                exclude=exclude, modern=modern or bool(tl),
                 need=1 if relaxed else None, stats=stats,
             )
             if log is not None:
@@ -775,7 +876,7 @@ def make_fallback_image(path, size, pool=None, avoid=None, title=""):
     return "रंगीन पृष्ठभूमि"
 
 
-def diagnose_services(pixabay_key=""):
+def diagnose_services(pixabay_key="", gemini_key=""):
     """हर बाहरी सेवा को एक छोटे परीक्षण से जाँचता है: [(नाम, ठीक?, विवरण)]"""
     rows = []
 
@@ -794,6 +895,31 @@ def diagnose_services(pixabay_key=""):
         res = fn("Babylon Ishtar Gate", errs)
         rows.append((name, len(res) > 0,
                      f"{len(res)} मिलीं" + (f" | {errs[0]}" if errs else "")))
+
+    for name, fn in (
+        ("ताज़ा समाचार-फोटो (Bing)", lambda q, e: bing_news_urls(q, e, "w")),
+        ("ताज़ा समाचार-फोटो (DDG)", lambda q, e: ddg_news_urls(q, e, "w")),
+        ("ताज़ा इंटरनेट-फोटो (DDG)", lambda q, e: web_urls(q, e, "w")),
+    ):
+        errs = []
+        res = fn("India cricket match", errs)
+        rows.append((name, len(res) > 0,
+                     f"{len(res)} मिलीं" + (f" | {errs[0]}" if errs else "")))
+
+    if gemini_key:
+        models, lerr = gemini_models(gemini_key)
+        try:
+            buf = io.BytesIO()
+            Image.new("RGB", (96, 96), (220, 30, 30)).save(buf, "JPEG")
+            parts = [
+                {"text": 'What is the dominant colour of this image? Reply ONLY JSON {"colour": "..."}'},
+                {"inline_data": {"mime_type": "image/jpeg",
+                                 "data": base64.b64encode(buf.getvalue()).decode()}},
+            ]
+            txt, gerr = gemini_generate_parts(gemini_key, parts, models or GEMINI_MODELS)
+            rows.append(("Gemini फोटो-जाँच", bool(txt), (txt[:50] if txt else gerr[:120]) or lerr))
+        except Exception as e:
+            rows.append(("Gemini फोटो-जाँच", False, str(e)[:100]))
 
     if pixabay_key:
         errs = []
@@ -823,27 +949,28 @@ def diagnose_services(pixabay_key=""):
     return rows
 
 
-def collect_photos(query, folder, tag, key, web_on, modern, n=6):
-    """हाथ से खोज: एक साथ कई विकल्प लौटाता है [(फ़ाइल, स्रोत)] और लॉग।"""
+def collect_photos(query, folder, tag, key, web_on, modern, n=6,
+                   timelimit=None, exclude=(), used=None):
+    """कई विकल्प लौटाता है [(फ़ाइल, स्रोत, url)] और लॉग।"""
+    tl = timelimit if timelimit is not None else ("y" if modern else "")
     words = match_words(query, "")
-    sources = []
-    if key:
-        sources.append(("Pixabay", lambda e: pixabay_urls(query, key, e)))
-    if not modern:
-        sources.append(("Wikimedia", lambda e: wikimedia_urls(query, e)))
-    if web_on:
-        sources.append(("इंटरनेट", lambda e: web_urls(query, e)))
-    sources.append(("Openverse", lambda e: openverse_urls(query, e)))
+    ex = [e.lower() for e in exclude if e]
+    used = used if used is not None else set()
 
     found, seen, log = [], set(), []
-    for name, fetch in sources:
+    for name, fetch in make_sources(query, key, web_on, tl):
         if len(found) >= n:
             break
         errs = []
         cands = fetch(errs)
         scored = []
         for url, text in cands:
-            if not url or url in seen:
+            if not url or url in seen or url in used:
+                continue
+            t = (text or "").lower()
+            if any(e in t for e in ex):
+                continue
+            if (modern or tl) and OLD_YEAR.search(t):
                 continue
             sc = score_text(text, words) if words else 1
             if sc >= 1:
@@ -872,10 +999,158 @@ def collect_photos(query, folder, tag, key, web_on, modern, n=6):
                 rgb.thumbnail((2000, 2000))
                 path = os.path.join(folder, f"cand_{tag}_{len(found)}.jpg")
                 rgb.save(path, "JPEG", quality=88)
-                found.append((path, name))
+                found.append((path, name, url))
             except Exception:
                 continue
     return found, log
+
+
+# ---------------------------------------------------------------- Gemini से तस्वीर की जाँच
+_GEM_LOCK = threading.Lock()
+_GEM_GATE = {"t": 0.0}
+
+
+def gemini_generate_parts(key, parts, models):
+    errors = []
+    url = "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent"
+    for model in models:
+        for use_json in (True, False):
+            try:
+                body = {"contents": [{"parts": parts}]}
+                if use_json:
+                    body["generationConfig"] = {"responseMimeType": "application/json"}
+                r = requests.post(
+                    url.format(model),
+                    headers={"x-goog-api-key": key, "Content-Type": "application/json"},
+                    json=body, timeout=90,
+                )
+                if r.status_code == 200:
+                    cands = r.json().get("candidates") or []
+                    if cands:
+                        ps = cands[0].get("content", {}).get("parts", [])
+                        text = "".join(p.get("text", "") for p in ps)
+                        if text.strip():
+                            return text, ""
+                    errors.append(f"{model}: खाली जवाब")
+                    break
+                errors.append(f"{model} {r.status_code}: {r.text[:140]}")
+                if r.status_code == 429:
+                    time.sleep(6)
+                if r.status_code == 400 and use_json and "mime" in r.text.lower():
+                    continue
+                if r.status_code in (400, 401, 403) and "key" in r.text.lower():
+                    return "", " | ".join(errors)[:400]
+                break
+            except Exception as e:
+                errors.append(f"{model}: {str(e)[:90]}")
+                break
+    return "", " | ".join(errors)[:400]
+
+
+def gemini_vision_pick(key, models, topic, scene_en, query, paths, fresh_hint):
+    """Gemini तस्वीरें देखकर सबसे सही चुनता है।
+    लौटाता है (नंबर 1..N, कारण); 0 = कोई ठीक नहीं; None = जाँच नहीं हो सकी।"""
+    prompt = (
+        "You are a strict photo editor for a Hindi video.\n"
+        f"Video topic: {topic[:200]}\n"
+        f"Scene narration (meaning in English): {scene_en[:400]}\n"
+        f"Search query used: {query}\n"
+        f"There are {len(paths)} candidate photos, numbered 1 to {len(paths)}.\n"
+        "Choose the ONE photo that best illustrates this scene. Rules: it must clearly "
+        "show the subject/event described, or a very closely related real scene. "
+        + ("The video is about a recent event, so the photo must look modern and recent "
+           "(modern kits, cameras, stadiums, clothing); reject old or black-and-white photos, "
+           "and photos of a different sport format, team or era. "
+           if fresh_hint else "")
+        + "Reject photos that are unrelated, mostly text, logos, screenshots, collages, "
+        "watermarked or very low quality. If none is acceptable return 0.\n"
+        'Reply ONLY JSON: {"best": <number 0..N>, "reason": "<max 12 words>"}'
+    )
+    parts = [{"text": prompt}]
+    for i, p in enumerate(paths, 1):
+        try:
+            with Image.open(p) as im:
+                im = to_rgb(im)
+                im.thumbnail((512, 512))
+                buf = io.BytesIO()
+                im.save(buf, "JPEG", quality=72)
+            parts.append({"text": f"Photo {i}:"})
+            parts.append({"inline_data": {
+                "mime_type": "image/jpeg",
+                "data": base64.b64encode(buf.getvalue()).decode(),
+            }})
+        except Exception:
+            return None, "तस्वीर पढ़ी नहीं जा सकी"
+
+    with _GEM_LOCK:
+        wait = 4.0 - (time.time() - _GEM_GATE["t"])
+        if wait > 0:
+            time.sleep(wait)
+        text, err = gemini_generate_parts(key, parts, models)
+        _GEM_GATE["t"] = time.time()
+
+    data = parse_json(text) if text else None
+    if not data:
+        return None, err or "जवाब समझ नहीं आया"
+    try:
+        best = int(data.get("best", 0))
+    except Exception:
+        return None, "जवाब में नंबर नहीं था"
+    reason = str(data.get("reason", ""))[:80]
+    if 1 <= best <= len(paths):
+        return best, reason
+    return 0, reason
+
+
+def smart_photo(queries, save_path, folder, tag, px_key, web_on, anchor,
+                modern, tl, gem, scene_en, topic, exclude, log, used, n=5):
+    """कई विकल्प जुटाकर (और Gemini हो तो उसे दिखाकर) सबसे सही तस्वीर चुनता है।"""
+    attempts = 0
+    for q in queries[:2]:
+        for lim in widen(tl):
+            if attempts >= 4:
+                return None, None
+            attempts += 1
+            found, clog = collect_photos(
+                q, folder, f"{tag}_{attempts}", px_key, web_on, modern or bool(lim),
+                n=n, timelimit=lim, exclude=exclude, used=used,
+            )
+            log.extend(f"'{q}' [{lim or 'कोई भी समय'}] {l}" for l in clog)
+            if not found:
+                continue
+
+            pick = 1
+            if gem:
+                pick, reason = gemini_vision_pick(
+                    gem["key"], gem["models"], topic, scene_en, q,
+                    [f_[0] for f_ in found], bool(lim) or modern,
+                )
+                if pick is None:
+                    log.append(f"⚠️ AI जाँच नहीं हो सकी ({reason}); पहली मेल खाती तस्वीर ली")
+                    pick = 1
+                elif pick == 0:
+                    log.append(f"🧐 AI जाँच ने सब तस्वीरें नकारीं: {reason}")
+                    for f_ in found:
+                        try:
+                            os.remove(f_[0])
+                        except Exception:
+                            pass
+                    continue
+                else:
+                    log.append(f"🧐 AI जाँच ने तस्वीर {pick} चुनी: {reason}")
+
+            path_, src_, url_ = found[pick - 1]
+            shutil.copy(path_, save_path)
+            used.add(url_)
+            for f_ in found:
+                try:
+                    os.remove(f_[0])
+                except Exception:
+                    pass
+            return src_ + (" ✔ AI जाँच" if gem and pick else ""), q
+    return None, None
+
+
 
 # ---------------------------------------------------------------- आवाज़
 def voice_params(text, speed_pct, natural):
@@ -1474,12 +1749,21 @@ def draft_job(P, cfg):
             modern = era.startswith("modern") if era else guess_modern(
                 topic, P["script"], extra
             )
-            P.update(anchor=anchor, topic=topic, modern=modern,
-                     plans=plans, planned=True)
+            fresh_code = cfg.get("fresh", "auto")
+            tl = ("m" if modern else "") if fresh_code == "auto" else fresh_code
+            P.update(anchor=anchor, topic=topic, modern=modern or bool(tl),
+                     plans=plans, planned=True, timelimit=tl)
             save_project(P)
 
         anchor, topic, modern = P["anchor"], P["topic"], P["modern"]
+        tl = P.get("timelimit", "m" if modern else "")
         plans = P.get("plans") or [None] * n
+
+        # Gemini से हर तस्वीर की जाँच (key हो और चालू हो तो)
+        gem = None
+        if cfg["gemini_key"] and cfg.get("verify", True):
+            g_models, _ = gemini_models(cfg["gemini_key"])
+            gem = {"key": cfg["gemini_key"], "models": g_models or GEMINI_MODELS}
 
         # 3) तस्वीरें: पहले सब दृश्यों की खोज साथ-साथ (तेज़), फिर बचे हुए के लिए AI
         used = P["used"]
@@ -1513,9 +1797,12 @@ def draft_job(P, cfg):
                 exclude = [str(e) for e in ex] if isinstance(ex, list) else []
             else:
                 queries, english = scene_queries(sc["text"], topic, anchor)
-            source, query = find_photo(
-                queries, path, used, cfg["pixabay_key"], cfg["use_web"],
-                anchor, exclude=exclude, modern=modern, log=log,
+            if not english:
+                english = translate_hi_en(sc["text"])
+            source, query = smart_photo(
+                queries, path, folder, f"s{i}", cfg["pixabay_key"], cfg["use_web"],
+                anchor, modern, tl, gem, english or sc["text"], topic,
+                exclude, log, used,
             )
             return {"i": i, "path": path, "source": source, "query": query,
                     "log": log, "plan": plan, "english": english,
@@ -1570,7 +1857,7 @@ def draft_job(P, cfg):
                 source, query = find_photo(
                     [anchor], path, used, cfg["pixabay_key"], cfg["use_web"],
                     anchor, exclude=exclude, modern=modern, relaxed=True,
-                    log=log,
+                    log=log, timelimit=tl,
                 )
 
             if source:
@@ -1835,11 +2122,20 @@ TRANS_NAMES = {
 }
 TITLE_STYLES = {"pop": "उभरकर आना (Pop)", "slide": "ऊपर से सरकना (Slide)", "fade": "धीरे से आना (Fade)"}
 TITLE_POS = {"top": "ऊपर", "center": "बीच में"}
+FRESH_OPTIONS = {
+    "📰 आज / ताज़ा (24 घंटे)": "d",
+    "🗓️ इस हफ़्ते की": "w",
+    "📆 इस महीने की": "m",
+    "📅 पिछले 1 साल की": "y",
+    "🏛️ कोई भी समय (ऐतिहासिक विषय)": "",
+}
+NEW_FRESH = {"🤖 अपने आप (विषय देखकर)": "auto", **FRESH_OPTIONS}
 
 DEFAULTS = {
     "script": "", "voice_name": list(VOICES.keys())[0], "speed": -5, "natural": True,
     "format_name": list(FORMATS.keys())[0], "quality": QUALITIES[0], "max_chars": 110,
     "use_web": True, "use_ai": True, "extra_topic": "",
+    "fresh_name": "🤖 अपने आप (विषय देखकर)", "verify": True,
     "captions_on": True, "cap_name": "मध्यम",
     "effect_choice": "Auto (हर दृश्य में अलग)", "transition_choice": "Auto (हर दृश्य अलग)",
     "gemini_key": "", "pixabay_key": "",
@@ -2013,6 +2309,7 @@ def make_cfg(resume=False, uploads=None):
         "use_web": S["use_web"], "use_ai": S["use_ai"],
         "gemini_key": eff_gemini(), "pixabay_key": eff_pixabay(),
         "extra_topic": S["extra_topic"], "uploads": uploads or [],
+        "fresh": NEW_FRESH.get(S["fresh_name"], "auto"), "verify": S["verify"],
         "render": render_cfg(),
     }
 
@@ -2027,13 +2324,15 @@ def status_chip(p):
     return '<span class="rs-chip rs-bad">⚠️ अधूरा</span>'
 
 
-def apply_image(sel, src_path, source, query):
+def apply_image(sel, src_path, source, query, flash=True):
     """चुनी तस्वीर की नई कॉपी लगाएँ (ताकि पुरानी वापस मिल सके)।"""
     sc = P["scenes"][sel]
     newp = os.path.join(P["folder"], f"scene_{sel}_{int(time.time() * 1000) % 10**9}.jpg")
     shutil.copy(src_path, newp)
     sc.setdefault("history", []).append((sc["image"], sc["source"], sc["query"]))
     sc.update(image=newp, source=source, query=query)
+    if flash:
+        st.session_state["flash"] = f"✅ दृश्य {sel + 1} में नई फोटो लग गई ({source})"
     save_project(P)
 
 
@@ -2130,6 +2429,18 @@ elif page == "✍️ नया":
     )
     S["use_ai"] = st.checkbox(
         "🤖 मेल खाती तस्वीर न मिले तो AI से बनाएँ", value=S["use_ai"], key="w_ai"
+    )
+    fresh_keys = list(NEW_FRESH.keys())
+    S["fresh_name"] = st.selectbox(
+        "📅 फोटो कितनी ताज़ा चाहिए?", fresh_keys,
+        index=fresh_keys.index(S["fresh_name"]) if S["fresh_name"] in fresh_keys else 0,
+        key="w_fresh",
+        help="आज के मैच/ख़बर की कहानी हो तो 'आज / ताज़ा' या 'इस हफ़्ते' चुनें। "
+             "ऐतिहासिक कहानी (जैसे बेबीलोन) हो तो 'कोई भी समय' चुनें।",
+    )
+    S["verify"] = st.checkbox(
+        "🧐 Gemini से हर फोटो की जाँच कराएँ (गलत/पुरानी फोटो हटती है; Gemini key चाहिए)",
+        value=S["verify"], key="w_verify",
     )
     S["extra_topic"] = st.text_input(
         "कहानी का मुख्य विषय English में (वैकल्पिक, हर खोज में जुड़ेगा)",
@@ -2249,14 +2560,30 @@ elif page == "🎞️ एडिटर":
                         st.download_button("⬇️ दूसरा तरीका: MP4", data=f,
                                            file_name="ravi_video.mp4", mime="video/mp4")
 
+        if st.session_state.get("flash"):
+            st.success(st.session_state.pop("flash"))
+
+        with st.expander("❓ फोटो कैसे बदलें? (5 आसान कदम)"):
+            st.markdown(
+                "1. नीचे **टाइमलाइन** में जिस दृश्य की फोटो बदलनी हो, उसका **नंबर वाला बटन** दबाएँ।\n"
+                "2. **🖼️ फोटो** खुला रखें। पुरानी फोटो हटानी हो तो **🗑️ यह फोटो हटाएँ** दबाएँ।\n"
+                "3. **नई फोटो लगाएँ** में तरीका चुनें: गैलरी, इंटरनेट, AI या लाइब्रेरी।\n"
+                "4. इंटरनेट में **✨ अपने आप सबसे सही फोटो लगाएँ** दबाएँ, या **🔍 विकल्प खोजें** से 6 फोटो देखकर "
+                "जिसे चाहें उसके नीचे **✅ लगाएँ** दबाएँ।\n"
+                "5. सारे बदलाव के बाद सबसे नीचे **🎬 वीडियो बनाएँ / दोबारा बनाएँ** दबाएँ।"
+            )
+
         # ---------- चुना हुआ दृश्य (पहले से सेट, ताकि widget बनने से पहले बदला जा सके)
         if "_sel_next" in st.session_state:
             st.session_state["sel"] = st.session_state.pop("_sel_next")
         if "sel" not in st.session_state or st.session_state["sel"] >= n:
             st.session_state["sel"] = 0
 
+        def _select(i_):
+            st.session_state["sel"] = i_
+
         # ---------- टाइमलाइन
-        st.markdown("**🎬 टाइमलाइन**")
+        st.markdown("**🎬 टाइमलाइन** (नंबर दबाकर दृश्य चुनें)")
         for r in range(0, n, 4):
             cols = st.columns(4)
             for c in range(4):
@@ -2267,9 +2594,13 @@ elif page == "🎞️ एडिटर":
                     sc_ = scenes[i]
                     if sc_.get("image") and os.path.exists(sc_["image"]):
                         st.image(get_thumb(sc_["image"]), use_container_width=True)
-                    mark = "🚫 " if not sc_["keep"] else ("▶ " if i == st.session_state["sel"] else "")
-                    title_mark = " 🔠" if (sc_.get("title") or "").strip() else ""
-                    st.caption(f"{mark}{i + 1}{title_mark}")
+                    mark = "🚫" if not sc_["keep"] else ""
+                    title_mark = "🔠" if (sc_.get("title") or "").strip() else ""
+                    st.button(
+                        f"{i + 1}{mark}{title_mark}", key=f"tl_{i}", on_click=_select, args=(i,),
+                        type="primary" if i == st.session_state["sel"] else "secondary",
+                        use_container_width=True,
+                    )
 
         def _prev():
             st.session_state["sel"] = max(0, st.session_state["sel"] - 1)
@@ -2341,33 +2672,73 @@ elif page == "🎞️ एडिटर":
             elif mode == "🌐 इंटरनेट से":
                 q = st.text_input(
                     "English शब्द (जितने सटीक, उतना अच्छा)",
-                    value=(sc["query"] if sc["source"] in ("इंटरनेट", "Wikimedia", "Openverse", "Pixabay") else ""),
-                    key=f"q_{sel}", placeholder="Ishtar Gate Babylon",
+                    value=(sc["query"] if sc["source"].split(" ")[0] in ("इंटरनेट", "Wikimedia", "Openverse", "Pixabay", "Bing", "समाचार-फोटो") else ""),
+                    key=f"q_{sel}", placeholder="India vs Australia ODI 2026",
                 )
+                fr_names = list(FRESH_OPTIONS.keys())
+                fr_codes = list(FRESH_OPTIONS.values())
+                cur_tl = P.get("timelimit", "")
+                fr_name = st.selectbox(
+                    "📅 फोटो कितनी ताज़ा?", fr_names,
+                    index=fr_codes.index(cur_tl) if cur_tl in fr_codes else 2,
+                    key=f"fr_{sel}",
+                )
+                tl_sel = FRESH_OPTIONS[fr_name]
+
+                if st.button("✨ अपने आप सबसे सही फोटो लगाएँ", key=f"auto_{sel}",
+                             type="primary", use_container_width=True):
+                    english = translate_hi_en(sc["text"]) or sc["text"]
+                    qq = q.strip() or with_anchor(
+                        " ".join(english_keywords(english)[:3]), P.get("anchor", "")
+                    )
+                    gem = None
+                    if eff_gemini() and S["verify"]:
+                        g_models, _ = gemini_models(eff_gemini())
+                        gem = {"key": eff_gemini(), "models": g_models or GEMINI_MODELS}
+                    newp = os.path.join(P["folder"], f"auto_{sel}_{int(time.time() * 1000) % 10**9}.jpg")
+                    alog = []
+                    with st.spinner("ताज़ा फोटो खोजकर जाँच रहे हैं..."):
+                        src_, q_used = smart_photo(
+                            [qq], newp, P["folder"], f"m{sel}", eff_pixabay(), S["use_web"],
+                            "", P.get("modern", False) or bool(tl_sel), tl_sel, gem, english,
+                            P.get("topic", ""), [], alog, set(),
+                        )
+                    if src_:
+                        add_to_library(newp, f"{src_}: {qq[:30]}")
+                        apply_image(sel, newp, src_, qq)
+                        st.rerun()
+                    else:
+                        st.warning("सही फोटो नहीं मिली। शब्द बदलें, समय-सीमा बढ़ाएँ या AI से बनवाएँ।")
+                        st.code("\n".join(alog) or "कोई स्रोत नहीं चला", language=None)
+
                 ckey = f"cands_{P['id']}_{sel}"
-                if st.button("🔍 विकल्प खोजें", key=f"s_{sel}", use_container_width=True):
+                if st.button("🔍 सारे विकल्प देखें (6 फोटो)", key=f"s_{sel}", use_container_width=True):
                     with st.spinner("कई विकल्प खोज रहे हैं..."):
                         found, log = collect_photos(
                             q, P["folder"], f"{sel}_{int(time.time()) % 100000}",
-                            eff_pixabay(), S["use_web"], P.get("modern", False), n=6,
+                            eff_pixabay(), S["use_web"], P.get("modern", False) or bool(tl_sel),
+                            n=6, timelimit=tl_sel,
                         )
                     st.session_state[ckey] = (q, found, log)
                 if ckey in st.session_state:
                     q_used, found, log = st.session_state[ckey]
                     if not found:
-                        st.warning("मेल खाती तस्वीर नहीं मिली। दूसरे शब्द आज़माएँ।")
+                        st.warning("मेल खाती तस्वीर नहीं मिली। दूसरे शब्द आज़माएँ या समय-सीमा बढ़ाएँ।")
                         st.code("\n".join(log) or "कोई स्रोत नहीं चला", language=None)
-                    for k in range(0, len(found), 3):
-                        cols = st.columns(3)
-                        for j in range(3):
+                    else:
+                        st.caption("जो फोटो चाहिए उसके नीचे '✅ लगाएँ' दबाएँ।")
+                    for k in range(0, len(found), 2):
+                        cols = st.columns(2)
+                        for j in range(2):
                             idx = k + j
                             if idx >= len(found):
                                 break
-                            path_, src_ = found[idx]
+                            path_, src_, _u = found[idx]
                             with cols[j]:
                                 st.image(get_thumb(path_), use_container_width=True)
                                 st.caption(src_)
-                                if st.button("✅ लगाएँ", key=f"pick_{sel}_{idx}"):
+                                if st.button("✅ लगाएँ", key=f"pick_{sel}_{idx}",
+                                             use_container_width=True):
                                     add_to_library(path_, f"{src_}: {q_used[:30]}")
                                     apply_image(sel, path_, src_, q_used)
                                     st.session_state.pop(ckey, None)
@@ -2697,7 +3068,7 @@ elif page == "🤖 AI फोटो":
             )
             g1, g2 = st.columns(2)
             if g1.button("✅ इस दृश्य में लगाएँ", use_container_width=True):
-                apply_image(target, lib[pick]["path"], "लाइब्रेरी", lib[pick]["label"][:60])
+                apply_image(target, lib[pick]["path"], "लाइब्रेरी", lib[pick]["label"][:60], flash=False)
                 st.success(f"दृश्य {target + 1} में फोटो लग गई।")
             with st.expander("➕ इस फोटो से नया दृश्य जोड़ें"):
                 new_txt = st.text_area(
@@ -2770,7 +3141,7 @@ else:
 
     if st.button("🧪 सेवाएँ जाँचें (तस्वीर/AI क्यों नहीं मिल रही)"):
         with st.spinner("हर सेवा जाँची जा रही है... (1-2 मिनट लग सकते हैं)"):
-            rows = diagnose_services(eff_pixabay())
+            rows = diagnose_services(eff_pixabay(), eff_gemini())
         for name_, good_, detail_ in rows:
             (st.success if good_ else st.error)(f"{name_}: {detail_}")
 
