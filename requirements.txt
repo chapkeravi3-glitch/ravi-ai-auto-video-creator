@@ -1,8 +1,5 @@
-streamlit>=1.37
+streamlit
 requests
-pillow
-pillow-heif
+Pillow
 edge-tts
-imageio-ffmpeg
-deep-translator
-ddgs
+gTTS
