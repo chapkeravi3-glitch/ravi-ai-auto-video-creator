@@ -1,5 +1,8 @@
-streamlit
+streamlit>=1.37
 requests
-Pillow
+pillow
+pillow-heif
 edge-tts
-gTTS
+imageio-ffmpeg
+deep-translator
+ddgs
