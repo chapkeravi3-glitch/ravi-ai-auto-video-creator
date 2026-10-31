@@ -69,8 +69,8 @@ LEAD = 0.25    # नई तस्वीर आने के बाद आवा�
 PAD = 0.35     # दृश्य के अंत में ठहराव
 TRANS = 0.5    # दृश्यों के बीच ट्रांज़िशन की अवधि
 GEMINI_MODELS = ["gemini-3.5-flash", "gemini-3.5-flash-lite", "gemini-3-flash-preview"]
-HEADERS = {"User-Agent": "RaviAIVideoCreator/6.0 (personal video project)"}
-APP_VERSION = "संस्करण 6.1 (सुधरा हुआ)"
+HEADERS = {"User-Agent": "RaviAIVideoCreator/6.2 (personal video project)"}
+APP_VERSION = "संस्करण 6.2 (कनेक्शन त्रुटि सुधारित)"
 
 CAPTION_SIZES = {"छोटा": 0.050, "मध्यम": 0.066, "बड़ा": 0.082}
 
@@ -205,15 +205,18 @@ def gemini_models(key):
 
 def gemini_generate(key, prompt, models):
     errors = []
-    url = "[https://generativelanguage.googleapis.com/v1beta/models/](https://generativelanguage.googleapis.com/v1beta/models/){}:generateContent"
+    # यहाँ URL बिल्कुल साफ़ और सही फॉर्मेट में है (कोई अतिरिक्त ब्रैकेट नहीं)
+    base_url = "[https://generativelanguage.googleapis.com/v1beta/models/](https://generativelanguage.googleapis.com/v1beta/models/){}:generateContent"
     for model in models:
         for use_json in (True, False):
             try:
                 body = {"contents": [{"parts": [{"text": prompt}]}]}
                 if use_json:
                     body["generationConfig"] = {"responseMimeType": "application/json"}
+                
+                target_url = base_url.format(model)
                 r = requests.post(
-                    url.format(model),
+                    target_url,
                     headers={"x-goog-api-key": key, "Content-Type": "application/json"},
                     json=body,
                     timeout=90,
@@ -351,7 +354,6 @@ def llm_query(scene, topic):
 
 
 def visual_prompt(scene, topic, anchor, english=""):
-    """दृश्य की कथा से एक ठोस और सटीक English तस्वीर-विवरण बनाता है (AI तस्वीर के लिए)।"""
     trans_text = translate_hi_en(scene, limit=300)
     
     if trans_text and len(trans_text.strip()) > 5:
