@@ -1,4 +1,4 @@
-import streamlit as str_lit # streamlit as st
+import streamlit as st
 import requests
 import subprocess
 import tempfile
@@ -17,14 +17,24 @@ from PIL import Image, ImageFont, ImageOps, ImageStat
 import edge_tts
 import imageio_ffmpeg
 
-# streamlit alias for clarity
-st = str_lit
-
 try:
     import pillow_heif
     pillow_heif.register_heif_opener()
 except Exception:
     pass
+
+# requirements.txt:
+# streamlit
+# requests
+# pillow
+# edge-tts
+# imageio-ffmpeg
+# deep-translator
+# ddgs
+# pillow-heif
+#
+# packages.txt (हिंदी कैप्शन के फ़ॉन्ट के लिए, Streamlit Cloud पर):
+# fonts-noto-core
 
 try:
     from deep_translator import GoogleTranslator
@@ -69,8 +79,8 @@ LEAD = 0.25    # नई तस्वीर आने के बाद आवा�
 PAD = 0.35     # दृश्य के अंत में ठहराव
 TRANS = 0.5    # दृश्यों के बीच ट्रांज़िशन की अवधि
 GEMINI_MODELS = ["gemini-3.5-flash", "gemini-3.5-flash-lite", "gemini-3-flash-preview"]
-HEADERS = {"User-Agent": "RaviAIVideoCreator/6.2 (personal video project)"}
-APP_VERSION = "संस्करण 6.2 (कनेक्शन त्रुटि सुधारित)"
+HEADERS = {"User-Agent": "RaviAIVideoCreator/6.0 (personal video project)"}
+APP_VERSION = "संस्करण 6.3 (पूर्ण फिक्स्ड कोड)"
 
 CAPTION_SIZES = {"छोटा": 0.050, "मध्यम": 0.066, "बड़ा": 0.082}
 
@@ -168,11 +178,14 @@ def parse_json(text):
 
 
 def gemini_models(key):
+    """Google से बताए गए उपलब्ध flash मॉडल। कनेक्शन एरर रोकने के लिए URL पूरी तरह स्वच्छ बनाया गया है।"""
     try:
+        clean_key = str(key).strip()
+        endpoint = "[https://generativelanguage.googleapis.com/v1beta/models](https://generativelanguage.googleapis.com/v1beta/models)"
         r = requests.get(
-            "[https://generativelanguage.googleapis.com/v1beta/models](https://generativelanguage.googleapis.com/v1beta/models)",
+            endpoint,
             params={"pageSize": 100},
-            headers={"x-goog-api-key": key},
+            headers={"x-goog-api-key": clean_key},
             timeout=30,
         )
         if r.status_code != 200:
@@ -205,8 +218,7 @@ def gemini_models(key):
 
 def gemini_generate(key, prompt, models):
     errors = []
-    # यहाँ URL बिल्कुल साफ़ और सही फॉर्मेट में है (कोई अतिरिक्त ब्रैकेट नहीं)
-    base_url = "[https://generativelanguage.googleapis.com/v1beta/models/](https://generativelanguage.googleapis.com/v1beta/models/){}:generateContent"
+    clean_key = str(key).strip()
     for model in models:
         for use_json in (True, False):
             try:
@@ -214,10 +226,12 @@ def gemini_generate(key, prompt, models):
                 if use_json:
                     body["generationConfig"] = {"responseMimeType": "application/json"}
                 
-                target_url = base_url.format(model)
+                # शुद्ध और सुरक्षित URL स्ट्रिंग
+                target_url = f"[https://generativelanguage.googleapis.com/v1beta/models/](https://generativelanguage.googleapis.com/v1beta/models/){model}:generateContent"
+                
                 r = requests.post(
                     target_url,
-                    headers={"x-goog-api-key": key, "Content-Type": "application/json"},
+                    headers={"x-goog-api-key": clean_key, "Content-Type": "application/json"},
                     json=body,
                     timeout=90,
                 )
@@ -257,6 +271,7 @@ def test_gemini(key):
 
 
 def plan_with_ai(scenes, opening, key, on_progress=None):
+    """हर दृश्य के लिए तस्वीर की खोज और AI prompt, मुफ़्त Gemini से।"""
     anchor = ""
     era = ""
     plans = [None] * len(scenes)
@@ -282,7 +297,8 @@ def plan_with_ai(scenes, opening, key, on_progress=None):
             "For EACH scene return:\n"
             '- "query": an English image-search query of 2 to 5 words for a REAL '
             "photograph, museum object, ruin, map or painting that visually matches "
-            "what is being said. Always include the specific subject name.\n"
+            "what is being said. Always include the specific subject name "
+            "(place, person, object) - never only generic words.\n"
             '- "ai": a detailed English prompt (one sentence) describing the '
             "visual, to generate an image if no photo is found. No text in the "
             "image, no real living people.\n"
@@ -354,6 +370,7 @@ def llm_query(scene, topic):
 
 
 def visual_prompt(scene, topic, anchor, english=""):
+    """हिंदी दृश्य का सटीक अंग्रेजी रूपांतरण करके मजबूत AI प्रॉम्प्ट बनाना।"""
     trans_text = translate_hi_en(scene, limit=300)
     
     if trans_text and len(trans_text.strip()) > 5:
@@ -378,6 +395,7 @@ def with_anchor(query, anchor):
 
 def scene_queries(scene, topic, anchor):
     queries = []
+
     q = llm_query(scene, topic)
     if q:
         queries.append(with_anchor(q, anchor))
@@ -398,6 +416,7 @@ def scene_queries(scene, topic, anchor):
     return final, english
 
 
+# ---------------------------------------------------------------- मेल की जाँच
 def match_words(query, anchor):
     words = re.findall(r"[a-z]+", f"{query} {anchor}".lower())
     strict = {
@@ -692,6 +711,7 @@ def make_fallback_image(path, size, pool=None, avoid=None):
 
 def diagnose_services(pixabay_key=""):
     rows = []
+
     en = translate_hi_en("नमस्ते दोस्तो")
     if GoogleTranslator is None:
         rows.append(("Google अनुवाद", False, "deep-translator इंस्टॉल नहीं है"))
@@ -937,7 +957,7 @@ def write_ass(path, cues, size, font_path, size_ratio, lead):
     return True
 
 
-# ---------------------------------------------------------------- वीडियो क्लिप
+# ---------------------------------------------------------------- वीडियो क्लिप (स्मूथ एनिमेशन)
 ZOOM = 1.22
 
 def motion_filter(effect, frames, w, h):
@@ -1108,10 +1128,12 @@ def add_music(video, music, out, volume, ffmpeg):
         raise RuntimeError(result.stderr[-2500:])
 
 
+# ---------------------------------------------------------------- बैकग्राउंड निष्पादन नियंत्रण
 import threading
 
 
 def save_project(P):
+    """स्थिति डिस्क पर रखें, ताकि ऐप रुकने के बाद भी काम लौटाया जा सके।"""
     try:
         data = {k: v for k, v in P.items() if k != "used"}
         data["used"] = list(P.get("used", []))
@@ -1188,6 +1210,7 @@ def set_state(P, status=None, progress=None):
 
 
 def publish_static(P, path):
+    """वीडियो की ऐसी कॉपी रखें जिसका सीधा डाउनलोड लिंक बन सके।"""
     P["static_name"] = ""
     try:
         base = os.path.dirname(os.path.abspath(__file__))
@@ -1214,6 +1237,7 @@ def draft_job(P, cfg):
         P["state"] = "drafting"
         P["error"] = ""
 
+        # 1) आवाज़
         if not resume:
             texts = split_scenes(P["script"], cfg["max_chars"])
             n = len(texts)
@@ -1250,6 +1274,7 @@ def draft_job(P, cfg):
 
         texts = [sc["text"] for sc in scenes]
 
+        # 2) विषय और योजना
         extra = cfg["extra_topic"].strip()
         if not P.get("planned"):
             set_state(P, "कहानी का विषय और हर दृश्य की योजना बन रही है...", 26)
@@ -1281,6 +1306,7 @@ def draft_job(P, cfg):
         anchor, topic, modern = P["anchor"], P["topic"], P["modern"]
         plans = P.get("plans") or [None] * n
 
+        # 3) तस्वीरें
         used = P["used"]
         last_good = None
         uploads = cfg["uploads"]
@@ -1470,6 +1496,7 @@ def start_thread(fn, P, cfg):
     t.start()
 
 
+# ---------------------------------------------------------------- Streamlit UI
 st.title("🎬 Ravi AI Auto Video Creator")
 st.caption(APP_VERSION)
 
