@@ -14,8 +14,9 @@ import time
 import threading
 import base64
 import hashlib
+import datetime
 from urllib.parse import quote
-from PIL import Image, ImageFont, ImageOps, ImageStat
+from PIL import Image, ImageDraw, ImageFilter, ImageChops, ImageFont, ImageOps, ImageStat
 import edge_tts
 import imageio_ffmpeg
 
@@ -35,8 +36,12 @@ except Exception:
 # ddgs
 # pillow-heif
 #
-# packages.txt (हिंदी कैप्शन के फ़ॉन्ट के लिए, Streamlit Cloud पर):
+# packages.txt (हिंदी कैप्शन और टेक्स्ट कार्ड के फ़ॉन्ट के लिए, Streamlit Cloud पर):
 # fonts-noto-core
+#
+# .streamlit/config.toml (सीधे डाउनलोड लिंक के लिए):
+# [server]
+# enableStaticServing = true
 
 try:
     from deep_translator import GoogleTranslator
@@ -60,6 +65,8 @@ st.set_page_config(
     layout="centered",
     initial_sidebar_state="collapsed",
 )
+
+TODAY = datetime.date.today()
 
 VOICES = {
     "हिंदी पुरुष": "hi-IN-MadhurNeural",
@@ -88,8 +95,8 @@ LEAD = 0.25    # नई तस्वीर आने के बाद आवा�
 PAD = 0.35     # दृश्य के अंत में ठहराव
 TRANS = 0.5    # दृश्यों के बीच ट्रांज़िशन की अवधि
 GEMINI_MODELS = ["gemini-3.5-flash", "gemini-3.5-flash-lite", "gemini-3-flash-preview"]
-HEADERS = {"User-Agent": "RaviAIVideoCreator/6.0 (personal video project)"}
-APP_VERSION = "Ravi Studio • संस्करण 9"
+HEADERS = {"User-Agent": "RaviAIVideoCreator/10.0 (personal video project)"}
+APP_VERSION = "Ravi Studio • संस्करण 10"
 
 CAPTION_SIZES = {"छोटा": 0.050, "मध्यम": 0.066, "बड़ा": 0.082}
 
@@ -106,6 +113,60 @@ FONT_URLS = [
     "https://github.com/google/fonts/raw/main/ofl/mukta/Mukta-Bold.ttf",
 ]
 
+GENDER_LABELS = {
+    "अपने-आप पहचाने": "auto",
+    "पुरुष (Men's)": "men",
+    "महिला (Women's)": "women",
+    "दोनों / कोई फ़र्क नहीं": "none",
+}
+
+# Gemini के "कितनी नई फोटो" जवाब को समय-सीमा कोड में बदलना, और हर कोड के लिए कितने दिन पीछे का साल मान्य
+REC_TO_TL = {"week": "w", "month": "m", "year": "y", "3y": "y", "any": ""}
+TL_DAYS = {"d": 3, "w": 9, "m": 40, "y": 370}
+TL_TEXT = {
+    "d": "taken today or yesterday (very recent news photo)",
+    "w": "taken within the last few days (recent news photo)",
+    "m": "taken within the last month",
+    "y": "taken within the last year",
+    "": "any date",
+}
+
+# ग़लत विषय की फोटो रोकने के लिए: (विषय पहचानने वाले शब्द, उस विषय में ग़लत मानी जाने वाली चीज़ें)
+DOMAINS = [
+    (("cricket", "क्रिकेट", "odi", "t20", "ipl", "bcci", "wicket"),
+     ["wwe", "wrestling", "wrestler", "football", "soccer", "fifa", "nba", "basketball",
+      "nfl", "rugby", "tennis", "golf", "hockey", "baseball", "boxing", "ufc", "mma",
+      "badminton", "kabaddi", "chess", "formula"]),
+    (("football", "soccer", "फुटबॉल", "fifa"),
+     ["cricket", "wwe", "wrestling", "nba", "tennis", "golf", "baseball", "rugby", "kabaddi"]),
+    (("tennis", "टेनिस"),
+     ["cricket", "wwe", "wrestling", "football", "soccer", "nba", "golf", "baseball"]),
+    (("wwe", "wrestling", "कुश्ती"),
+     ["cricket", "football", "soccer", "nba", "tennis", "golf"]),
+]
+
+STOP_HI = set(
+    "है हैं था थी थे हो हुआ हुई हुए की के का को में से पर और या कि जो यह वह इस उस ने भी "
+    "तो ही एक कर करने किया गया गई गए रहा रही रहे लिए साथ बाद तक".split()
+)
+
+# टेक्स्ट कार्ड के रंग: (गहरा, मध्य, चमक) पृष्ठभूमि और (हाइलाइट RGB, ASS रंग)
+CARD_BG = [
+    ("#0b132b", "#1c2541", "#3a506b"),
+    ("#1a0b2e", "#3d1a78", "#6a0572"),
+    ("#0f2027", "#203a43", "#2c5364"),
+    ("#200122", "#6f0000", "#a4133c"),
+    ("#04293a", "#064663", "#0b7a75"),
+]
+CARD_ACCENT = [
+    ("#FFD700", "&H0000D7FF&"),
+    ("#00E5FF", "&H00FFE500&"),
+    ("#FF4081", "&H008140FF&"),
+    ("#69F0AE", "&H00AEF069&"),
+    ("#FF9100", "&H000091FF&"),
+]
+
+_HASH_LOCK = threading.Lock()
 
 
 # ---------------------------------------------------------------- दृश्य बाँटना
@@ -137,6 +198,17 @@ def split_scenes(text, limit):
     return [s for s in scenes if s.strip()]
 
 
+def auto_headline(text, n=5):
+    """दृश्य के अपने शब्दों से बड़े अक्षरों वाला छोटा वाक्यांश (फोटो न मिलने पर स्क्रीन पर दिखेगा)।"""
+    text = (text or "").strip()
+    first = re.split(r"[।!?\.,;:—\n]", text)[0] if text else ""
+    ws = [w.strip("\"'“”‘’()[]") for w in first.split()]
+    ws = [w for w in ws if w and w not in STOP_HI]
+    if len(ws) < 2:
+        ws = [w for w in re.sub(r"[।!?\.,;:—]", " ", text).split() if w not in STOP_HI]
+    return " ".join(ws[:n])
+
+
 # ---------------------------------------------------------------- खोज के शब्द
 STOPWORDS = set("""
 the and for with that this from they them their there were was are been being have has had
@@ -149,6 +221,10 @@ one two three four five six seven eight nine ten again once here those these its
 GENERIC = set(
     "ancient city people photo image picture view history historical old world great".split()
 )
+
+
+def has_word(text, w):
+    return bool(re.search(r"(?<![a-z0-9])" + re.escape(w) + r"(?![a-z0-9])", text))
 
 
 def translate_hi_en(text, limit=1500):
@@ -185,6 +261,28 @@ def parse_json(text):
             except Exception:
                 return None
     return None
+
+
+def guess_gender(blob):
+    b = (blob or "").lower()
+    w = bool(re.search(r"महिला|women|ladies|female|girls|लड़कियाँ|लड़कियां", b))
+    m = bool(re.search(r"पुरुष|men's|\bmen\b|gents|\bmale\b", b))
+    if w and not m:
+        return "women"
+    if m and not w:
+        return "men"
+    return "none"
+
+
+def domain_excludes(blob):
+    """विषय (जैसे क्रिकेट) पहचानकर दूसरे विषयों (WWE, फुटबॉल...) के शब्द 'ग़लत' सूची में डालता है।"""
+    b = (blob or "").lower()
+    out, own = set(), set()
+    for trig, ex in DOMAINS:
+        if any(has_word(b, t) for t in trig):
+            out |= set(ex)
+            own |= set(trig)
+    return sorted(out - own)
 
 
 def gemini_models(key):
@@ -274,45 +372,105 @@ def test_gemini(key):
     return False, f"काम नहीं बना: {err}"
 
 
-def plan_with_ai(scenes, opening, key, on_progress=None):
-    """हर दृश्य के लिए तस्वीर की खोज और AI prompt, मुफ़्त Gemini से।"""
-    anchor = ""
-    era = ""
+def normalize_ctx(d):
+    d = d if isinstance(d, dict) else {}
+    g = str(d.get("gender", "")).lower()
+    g = g if g in ("men", "women") else "none"
+    rec = str(d.get("recency", "")).lower()
+    rec = rec if rec in REC_TO_TL else ""
+    era = "historical" if str(d.get("era", "")).lower().startswith("hist") else "modern"
+
+    def words(v, n):
+        out = []
+        for x in (v if isinstance(v, list) else []):
+            if isinstance(x, str):
+                x = x.strip().lower()
+                if len(x) >= 2 and x not in out:
+                    out.append(x)
+        return out[:n]
+
+    return {
+        "topic_en": str(d.get("topic_en", "")).strip()[:300],
+        "anchor": str(d.get("anchor", "")).strip()[:60],
+        "era": era, "gender": g, "recency": rec,
+        "must_any": words(d.get("must_any"), 8),
+        "off_topic": words(d.get("off_topic"), 14),
+    }
+
+
+def analyze_story(script, extra, key, models):
+    """पूरी कहानी एक बार पढ़कर: विषय, दौर, पुरुष/महिला, कितनी नई फोटो, ज़रूरी/ग़लत शब्द।"""
+    prompt = (
+        "Today's date is " + TODAY.isoformat() + ".\n"
+        "Analyse this Hindi story to choose matching REAL photographs. Reply with ONLY JSON:\n"
+        '{"topic_en":"one English sentence: what the story is about",'
+        '"anchor":"1-3 English words naming the main subject, e.g. India women cricket",'
+        '"era":"modern" or "historical",'
+        '"gender":"men" or "women" or "none" (are the people/teams in the story men or women; '
+        '"none" if mixed or not about people),'
+        '"recency":"week" or "month" or "year" or "3y" or "any" (how recent the photos must be: '
+        '"week" if it is about today\'s or this week\'s event, "any" for history),'
+        '"must_any":[3 to 8 lowercase English words such as team, sport, person and place names; '
+        'a correct photo caption normally contains at least one],'
+        '"off_topic":[up to 12 lowercase English words that signal a WRONG photo for this story, '
+        "such as other sports or unrelated celebrities]}\n"
+        + (f"Main subject given by the user: {extra}\n" if extra else "")
+        + "Story:\n" + script[:2000]
+    )
+    text, err = gemini_generate(key, prompt, models)
+    return (parse_json(text) if text else None), err
+
+
+PLAN_PROMPT = (
+    "You choose real photographs for a Hindi video. Today's date: {today}.\n"
+    "Story: {topic}\nMain subject: {anchor}. People in the story: {gender}. Era: {era}.\n"
+    "Scenes (Hindi), numbered:\n{listing}\n\n"
+    "For EACH scene return:\n"
+    '- "queries": 2 English image-search queries (2-6 words) for a REAL photograph showing '
+    "what this scene says. First = most specific (team/person/place names + what is happening"
+    "{yearhint}), second = safer and broader. Always keep the main subject name; never only "
+    "generic words.\n"
+    '- "ai": ONE detailed English sentence describing the photo to generate if no real photo '
+    "exists: same subject, same men/women, setting, lighting. No text in the image.\n"
+    '- "exclude": 0 to 5 English words that would show a WRONG photo for this scene.\n'
+    '- "headline": 2 to 5 words in Devanagari copied or shortened from the scene itself, the '
+    "key phrase to show as big text if no photo is found.\n"
+    'Also return "anchor" (1-2 word main subject of the whole story) and "era" '
+    '("modern" if the story is about events after 2012, otherwise "historical").\n'
+    'Respond with ONLY JSON: {"anchor":"...","era":"modern","scenes":[{"n":1,'
+    '"queries":["...","..."],"ai":"...","exclude":["..."],"headline":"..."}]}'
+)
+
+
+def plan_with_ai(scenes, opening, key, on_progress=None, ctx=None, topic="", anchor=""):
+    """हर दृश्य के लिए तस्वीर की खोज, AI prompt और टेक्स्ट कार्ड का वाक्यांश, मुफ़्त Gemini से।"""
+    ctx = ctx or {}
+    g_anchor = anchor or ctx.get("anchor", "")
+    era = ctx.get("era", "")
     plans = [None] * len(scenes)
     last_error = ""
-    CH = 15
+    CH = 12
     models, list_err = gemini_models(key)
     if not models:
         models = GEMINI_MODELS
         last_error = list_err
+    gtxt = {"men": "men (male)", "women": "women (female)"}.get(
+        ctx.get("gender"), "mixed or not specified")
 
     for start in range(0, len(scenes), CH):
         chunk = scenes[start:start + CH]
-        numbered = "\n".join(
+        listing = "\n".join(
             f"{start + j + 1}. {s[:300]}" for j, s in enumerate(chunk)
         )
+        fresh = ctx.get("recency") in ("week", "month", "year")
         prompt = (
-            "You choose real photographs for a Hindi documentary-style video.\n"
-            f"Story opening (Hindi): {opening[:700]}\n\n"
-            "Scenes (Hindi), numbered:\n"
-            f"{numbered}\n\n"
-            "For EACH scene return:\n"
-            '- "query": an English image-search query of 2 to 5 words for a REAL '
-            "photograph, museum object, ruin, map or painting that visually matches "
-            "what is being said. Always include the specific subject name "
-            "(place, person, object) - never only generic words.\n"
-            '- "ai": a detailed English prompt (one sentence) describing the '
-            "visual, to generate an image if no photo is found. No text in the "
-            "image, no real living people.\n"
-            '- "exclude": a list of 0 to 4 English words that must NOT appear in '
-            'the photo title (for example "test" when the story is about one-day '
-            "matches, or wrong teams).\n"
-            'Also return "anchor": the one or two word main subject of the whole story, '
-            'and "era": "modern" if the story is about events after 2012, '
-            'otherwise "historical".\n'
-            "Respond with ONLY JSON, no markdown: "
-            '{"anchor":"...","era":"modern","scenes":[{"n":1,"query":"...",'
-            '"ai":"...","exclude":["..."]}]}'
+            PLAN_PROMPT.replace("{today}", TODAY.isoformat())
+            .replace("{topic}", topic or opening[:300])
+            .replace("{anchor}", g_anchor or "unknown")
+            .replace("{gender}", gtxt)
+            .replace("{era}", era or "modern")
+            .replace("{yearhint}", f", add the year {TODAY.year}" if fresh else "")
+            .replace("{listing}", listing)
         )
 
         data = None
@@ -331,7 +489,7 @@ def plan_with_ai(scenes, opening, key, on_progress=None):
         if not data:
             continue
 
-        anchor = anchor or str(data.get("anchor", "")).strip()
+        g_anchor = g_anchor or str(data.get("anchor", "")).strip()
         era = era or str(data.get("era", "")).strip().lower()
         for item in data.get("scenes", []):
             try:
@@ -341,7 +499,7 @@ def plan_with_ai(scenes, opening, key, on_progress=None):
             if 0 <= n < len(scenes):
                 plans[n] = item
 
-    return anchor, plans, last_error, era
+    return g_anchor, plans, last_error, era
 
 
 def llm_query(scene, topic):
@@ -373,6 +531,12 @@ def llm_query(scene, topic):
         return None
 
 
+def with_anchor(query, anchor):
+    if anchor and anchor.lower() not in query.lower() and len(query.split()) < 4:
+        return f"{anchor} {query}"
+    return query
+
+
 def visual_prompt(scene, topic, anchor, english=""):
     """दृश्य की कथा से एक ठोस English तस्वीर-विवरण बनाता है (AI तस्वीर के लिए)।"""
     ask = (
@@ -401,12 +565,6 @@ def visual_prompt(scene, topic, anchor, english=""):
     if english.strip():
         return with_anchor(english.strip()[:300], anchor)
     return ""  # विवरण नहीं बना तो बेमतलब तस्वीर नहीं बनाएँगे
-
-
-def with_anchor(query, anchor):
-    if anchor and anchor.lower() not in query.lower():
-        return f"{anchor} {query}"
-    return query
 
 
 def scene_queries(scene, topic, anchor):
@@ -447,6 +605,88 @@ def match_words(query, anchor):
 def score_text(text, words):
     t = (text or "").lower()
     return sum(1 for w in words if w in t)
+
+
+GENDER_W = re.compile(r"\b(women|women's|womens|woman|female|ladies|girls?)\b", re.I)
+GENDER_M = re.compile(r"\b(men|men's|mens|man|male|boys?|gents)\b", re.I)
+YEAR_RE = re.compile(r"(?<!\d)(19\d\d|20\d\d)(?!\d)")
+DATE8_RE = re.compile(r"(?<!\d)(20\d\d)(?=(?:0[1-9]|1[0-2])[0-3]\d(?!\d))")
+
+
+def gender_ok(text, gender):
+    """पुरुषों की कहानी में महिला वाली और महिलाओं की कहानी में पुरुष वाली फोटो नहीं।"""
+    t = (text or "").replace("’", "'")
+    w, m = bool(GENDER_W.search(t)), bool(GENDER_M.search(t))
+    if gender == "women":
+        return not (m and not w)
+    if gender == "men":
+        return not w
+    return True
+
+
+def years_in(text):
+    t = re.sub(r"\d{3,4}\s*[x×]\s*\d{3,4}", " ", text or "")
+    ys = [int(y) for y in YEAR_RE.findall(t)] + [int(y) for y in DATE8_RE.findall(t)]
+    return [y for y in ys if 2005 <= y <= TODAY.year + 1]
+
+
+def ahash(img):
+    g = img.convert("L").resize((8, 8), Image.LANCZOS)
+    px = list(g.getdata())
+    avg = sum(px) / 64
+    return sum(1 << i for i, p in enumerate(px) if p >= avg)
+
+
+def ahash_file(path):
+    with Image.open(path) as im:
+        return ahash(to_rgb(im))
+
+
+def is_dup(h, hashes, thr=5):
+    return any(bin(h ^ x).count("1") <= thr for x in hashes)
+
+
+def make_rules(P, plan_exclude=None, vision=False):
+    """एक खोज के सारे नियम: पुरुष/महिला, ज़रूरी शब्द, ग़लत शब्द, साल, पहले लग चुकी फोटो।"""
+    ctx = P.get("ctx") or {}
+    tl = P.get("timelimit", "")
+    must = [m for m in (ctx.get("must_any") or []) if m]
+    ex = set(ctx.get("off_topic") or []) | set(P.get("domain_ex") or [])
+    for e in (plan_exclude or []):
+        ex.add(str(e).strip().lower())
+    own = set(must) | set(re.findall(r"[a-z]+", (P.get("anchor") or "").lower()))
+    ex = {e for e in ex if len(e) >= 2 and e not in own}
+    ex_re = (re.compile(r"(?<![a-z0-9])(?:" + "|".join(re.escape(e) for e in sorted(ex))
+                        + r")(?![a-z0-9])") if ex else None)
+    return {
+        "gender": ctx.get("gender", "none"), "must": must, "ex": sorted(ex), "ex_re": ex_re,
+        "year_from": P.get("year_from"), "vision": bool(vision),
+        "rec_txt": TL_TEXT.get(tl, "any date"), "topic": P.get("topic", ""),
+        "hashes": P.setdefault("hashes", []),
+    }
+
+
+def rule_score(t, rules):
+    """शीर्षक/टैग (छोटे अक्षरों में) देखकर: -1 = सीधे नकारो, वरना बोनस अंक।"""
+    if not rules:
+        return 0
+    t = (t or "").lower().replace("’", "'")
+    if rules["ex_re"] and rules["ex_re"].search(t):
+        return -1
+    if not gender_ok(t, rules["gender"]):
+        return -1
+    yf = rules.get("year_from")
+    if yf:
+        ys = years_in(t)
+        if ys and max(ys) < yf:
+            return -1  # पुरानी फोटो
+    must_hit = any(m in t for m in rules["must"]) if rules["must"] else True
+    if rules["must"] and not must_hit and not rules["vision"]:
+        return -1  # विषय का कोई ज़रूरी शब्द ही नहीं, और AI देखकर जाँचेगा भी नहीं
+    bonus = 1 if (must_hit and rules["must"]) else 0
+    if rules["gender"] == "women" and GENDER_W.search(t):
+        bonus += 1
+    return bonus
 
 
 # ---------------------------------------------------------------- तस्वीर के स्रोत
@@ -490,7 +730,8 @@ def web_urls(query, err=None, timelimit=None):
                 results = list(d.images(query, max_results=25, timelimit=timelimit or None))
             except TypeError:
                 results = list(d.images(query, max_results=25))
-        return [(r.get("image"), r.get("title", "")) for r in results]
+        return [(r.get("image"), f"{r.get('title', '')} {(r.get('url') or '').split('?')[0]}")
+                for r in results]
     except Exception as e:
         _note(err, f"इंटरनेट खोज: {type(e).__name__}: {str(e)[:90]}")
         return []
@@ -689,15 +930,15 @@ def try_download(cands, save_path, used, words, max_tries=8,
     return False
 
 
-WIKI_YEARS = {"d": 1, "w": 1, "m": 1, "y": 2}
-
-
 def widen(tl):
     """ताज़ा तस्वीर न मिले तो समय-सीमा धीरे-धीरे बढ़ाएँ।"""
     order = ["d", "w", "m", "y"]
     if tl in order:
         return order[order.index(tl):]
     return [tl or ""]
+
+
+WIKI_YEARS = {"d": 1, "w": 1, "m": 1, "y": 2}
 
 
 def make_sources(query, px_key, web_on, tl):
@@ -709,7 +950,7 @@ def make_sources(query, px_key, web_on, tl):
             srcs.append(("समाचार-फोटो", lambda e: ddg_news_urls(query, e, tl)))
             srcs.append(("इंटरनेट (ताज़ा)", lambda e: web_urls(query, e, tl)))
         srcs.append(("Wikimedia (नई)", lambda e: wikimedia_urls(query, e, WIKI_YEARS.get(tl, 2))))
-        if px_key:
+        if px_key and tl not in ("d", "w"):
             srcs.append(("Pixabay (नई)", lambda e: pixabay_urls(query, px_key, e, latest=True)))
     else:
         if px_key:
@@ -753,8 +994,8 @@ def guess_modern(*texts):
     if re.search(r"\b(20[1-3]\d)\b", blob):
         return True
     return bool(re.search(
-        r"cricket|odi\b|t20|ipl|world cup|match|tournament|league|"
-        r"election|smartphone|startup",
+        r"cricket|क्रिकेट|odi\b|t20|ipl|world cup|match|मैच|tournament|league|"
+        r"election|चुनाव|smartphone|startup",
         blob,
     ))
 
@@ -818,65 +1059,37 @@ def ai_image(prompt, save_path, size, err=None):
     return False
 
 
-def _title_card(img, title):
-    """रंगीन पृष्ठभूमि पर विषय का नाम बड़े अक्षरों में लिखता है (सिर्फ़ English)।"""
-    title = re.sub(r"[^A-Za-z0-9 ,.&'-]", "", title or "").strip().upper()
-    if not title:
-        return img
-    try:
-        from PIL import ImageDraw
-        font_path = get_caption_font()
-        if not font_path:
-            return img
-        w, h = img.size
-        fsize = max(24, int(min(w, h) * 0.10))
-        font = ImageFont.truetype(font_path, fsize)
-        draw = ImageDraw.Draw(img)
+def card_idx_for(path):
+    """फ़ाइल के नाम से टेक्स्ट कार्ड का रंग-क्रम तय (पृष्ठभूमि और शब्दों का रंग मेल खाए)।"""
+    return int(hashlib.md5(str(path).encode()).hexdigest()[:4], 16) % len(CARD_BG)
 
-        lines, cur = [], ""
-        for word in title.split():
-            trial = (cur + " " + word).strip()
-            if cur and draw.textlength(trial, font=font) > w * 0.8:
-                lines.append(cur)
-                cur = word
-            else:
-                cur = trial
-        if cur:
-            lines.append(cur)
 
-        lh = int(fsize * 1.25)
-        y = (h - lh * len(lines)) // 2
-        for ln in lines[:4]:
-            tw = draw.textlength(ln, font=font)
-            x = (w - tw) // 2
-            draw.text((x + 3, y + 3), ln, font=font, fill=(0, 0, 0))
-            draw.text((x, y), ln, font=font, fill=(255, 255, 255))
-            y += lh
-    except Exception:
-        pass
-    return img
+def make_text_card(path, size, idx=None):
+    """तस्वीर न मिलने पर आधुनिक रंगीन पृष्ठभूमि। शब्द वीडियो बनाते समय ऊपर लिखे जाते हैं।"""
+    idx = card_idx_for(path) if idx is None else idx
+    w, h = size
+    c1, c2, c3 = CARD_BG[idx % len(CARD_BG)]
+    base = ImageOps.colorize(Image.linear_gradient("L").resize((w, h)), c1, c2)
+    glow = Image.new("RGB", (w, h), (0, 0, 0))
+    d = ImageDraw.Draw(glow)
+    d.ellipse([w * 0.45, -h * 0.12, w * 1.35, h * 0.45], fill=c3)
+    d.ellipse([-w * 0.4, h * 0.6, w * 0.6, h * 1.2], fill=c3)
+    glow = glow.filter(ImageFilter.GaussianBlur(max(20, min(w, h) // 5)))
+    out = ImageChops.screen(base, glow)
+    bar = CARD_ACCENT[idx % len(CARD_ACCENT)][0]
+    ImageDraw.Draw(out).rectangle(
+        [int(w * 0.07), int(h * 0.16), int(w * 0.07) + int(w * 0.16),
+         int(h * 0.16) + max(6, h // 140)],
+        fill=bar,
+    )
+    out.save(path, "JPEG", quality=92)
 
 
 def make_fallback_image(path, size, pool=None, avoid=None, title=""):
-    """तस्वीर न मिले तो पहले मिली किसी तस्वीर को दोहराएँ, नहीं तो शीर्षक-कार्ड।"""
-    pool = [p for p in (pool or []) if p and os.path.exists(p)]
-    other = [p for p in pool if p != avoid]
-    chosen = other or pool  # रंगीन पृष्ठभूमि से बेहतर है मिली हुई तस्वीर दोहराना
-    if chosen:
-        shutil.copy(random.choice(chosen), path)
-        return "पहले की तस्वीर"
-
-    palettes = [
-        ("#1b2a6b", "#b21f66"), ("#0f2027", "#2c7a7b"),
-        ("#42275a", "#734b6d"), ("#232526", "#c9a227"),
-    ]
-    c1, c2 = random.choice(palettes)
-    grad = Image.linear_gradient("L").resize(size)
-    if random.random() < 0.5:
-        grad = grad.rotate(90, expand=True).resize(size)
-    card = _title_card(ImageOps.colorize(grad, c1, c2), title)
-    card.save(path, "JPEG", quality=90)
-    return "रंगीन पृष्ठभूमि"
+    """तस्वीर न मिले तो आधुनिक टेक्स्ट-कार्ड की पृष्ठभूमि (पुरानी तस्वीर दोहराना या सादा रंग नहीं)।
+    शब्द वीडियो बनाते समय दृश्य के 'headline' से ऊपर लिखे जाते हैं।"""
+    make_text_card(path, size)
+    return "टेक्स्ट कार्ड"
 
 
 def diagnose_services(pixabay_key="", gemini_key=""):
@@ -953,14 +1166,15 @@ def diagnose_services(pixabay_key="", gemini_key=""):
 
 
 def collect_photos(query, folder, tag, key, web_on, modern, n=6,
-                   timelimit=None, exclude=(), used=None):
-    """कई विकल्प लौटाता है [(फ़ाइल, स्रोत, url)] और लॉग।"""
+                   timelimit=None, exclude=(), used=None, rules=None):
+    """कई विकल्प लौटाता है [(फ़ाइल, स्रोत, url)] और लॉग। rules हों तो पुरुष/महिला, साल,
+    ग़लत शब्द और पहले लग चुकी फोटो से मिलती-जुलती फोटो अपने-आप हट जाती हैं।"""
     tl = timelimit if timelimit is not None else ("y" if modern else "")
     words = match_words(query, "")
     ex = [e.lower() for e in exclude if e]
     used = used if used is not None else set()
 
-    found, seen, log = [], set(), []
+    found, seen, log, local_h = [], set(), [], []
     for name, fetch in make_sources(query, key, web_on, tl):
         if len(found) >= n:
             break
@@ -975,12 +1189,15 @@ def collect_photos(query, folder, tag, key, web_on, modern, n=6,
                 continue
             if (modern or tl) and OLD_YEAR.search(t):
                 continue
+            bonus = rule_score(t, rules)
+            if bonus < 0:
+                continue
             sc = score_text(text, words) if words else 1
             if sc >= 1:
-                scored.append((sc, url))
+                scored.append((sc + bonus, url))
         scored.sort(key=lambda x: -x[0])
         log.append(
-            f"{name}: {len(cands)} मिलीं, {len(scored)} मेल खाईं"
+            f"{name}: {len(cands)} मिलीं, {len(scored)} नियमों पर खरी"
             + (f" | समस्या: {errs[0]}" if errs else "")
         )
 
@@ -999,6 +1216,12 @@ def collect_photos(query, folder, tag, key, web_on, modern, n=6,
                     rgb = to_rgb(img)
                 if rgb.width < 400 or rgb.height < 300 or is_blank(rgb):
                     continue
+                h = ahash(rgb)
+                if rules and is_dup(h, rules["hashes"]):
+                    continue  # यही या इससे मिलती फोटो किसी दृश्य में पहले लग चुकी है
+                if is_dup(h, local_h):
+                    continue
+                local_h.append(h)
                 rgb.thumbnail((2000, 2000))
                 path = os.path.join(folder, f"cand_{tag}_{len(found)}.jpg")
                 rgb.save(path, "JPEG", quality=88)
@@ -1050,17 +1273,30 @@ def gemini_generate_parts(key, parts, models):
     return "", " | ".join(errors)[:400]
 
 
-def gemini_vision_pick(key, models, topic, scene_en, query, paths, fresh_hint):
+def gemini_vision_pick(key, models, topic, scene_en, query, paths, fresh_hint, rules=None):
     """Gemini तस्वीरें देखकर सबसे सही चुनता है।
     लौटाता है (नंबर 1..N, कारण); 0 = कोई ठीक नहीं; None = जाँच नहीं हो सकी।"""
+    extra = f"Today's date is {TODAY.isoformat()}. "
+    if rules:
+        g = {"men": "men's (male players/people only)",
+             "women": "women's (female players/people only)"}.get(rules.get("gender"))
+        if g:
+            extra += f"People/teams in the photo must be {g}; a photo of the other gender is WRONG. "
+        if rules.get("ex"):
+            extra += "Never choose photos showing: " + ", ".join(rules["ex"][:12]) + ". "
+        if rules.get("rec_txt") and rules["rec_txt"] != "any date":
+            extra += f"The photo must be {rules['rec_txt']}. "
     prompt = (
         "You are a strict photo editor for a Hindi video.\n"
         f"Video topic: {topic[:200]}\n"
         f"Scene narration (meaning in English): {scene_en[:400]}\n"
         f"Search query used: {query}\n"
-        f"There are {len(paths)} candidate photos, numbered 1 to {len(paths)}.\n"
+        + extra +
+        f"\nThere are {len(paths)} candidate photos, numbered 1 to {len(paths)}.\n"
         "Choose the ONE photo that best illustrates this scene. Rules: it must clearly "
         "show the subject/event described, or a very closely related real scene. "
+        "REJECT a photo that shows a different sport, subject or person than the story "
+        "(for example a wrestler or film star in a cricket story). "
         + ("The video is about a recent event, so the photo must look modern and recent "
            "(modern kits, cameras, stadiums, clothing); reject old or black-and-white photos, "
            "and photos of a different sport format, team or era. "
@@ -1106,8 +1342,9 @@ def gemini_vision_pick(key, models, topic, scene_en, query, paths, fresh_hint):
 
 
 def smart_photo(queries, save_path, folder, tag, px_key, web_on, anchor,
-                modern, tl, gem, scene_en, topic, exclude, log, used, n=5):
-    """कई विकल्प जुटाकर (और Gemini हो तो उसे दिखाकर) सबसे सही तस्वीर चुनता है।"""
+                modern, tl, gem, scene_en, topic, exclude, log, used, n=5, rules=None):
+    """कई विकल्प जुटाकर (और Gemini हो तो उसे दिखाकर) सबसे सही तस्वीर चुनता है।
+    नियम (rules) के हिसाब से ग़लत/पुरानी/दोहराई तस्वीर कभी नहीं चुनी जाती।"""
     attempts = 0
     for q in queries[:2]:
         for lim in widen(tl):
@@ -1116,7 +1353,7 @@ def smart_photo(queries, save_path, folder, tag, px_key, web_on, anchor,
             attempts += 1
             found, clog = collect_photos(
                 q, folder, f"{tag}_{attempts}", px_key, web_on, modern or bool(lim),
-                n=n, timelimit=lim, exclude=exclude, used=used,
+                n=n, timelimit=lim, exclude=exclude, used=used, rules=rules,
             )
             log.extend(f"'{q}' [{lim or 'कोई भी समय'}] {l}" for l in clog)
             if not found:
@@ -1126,10 +1363,10 @@ def smart_photo(queries, save_path, folder, tag, px_key, web_on, anchor,
             if gem:
                 pick, reason = gemini_vision_pick(
                     gem["key"], gem["models"], topic, scene_en, q,
-                    [f_[0] for f_ in found], bool(lim) or modern,
+                    [f_[0] for f_ in found], bool(lim) or modern, rules,
                 )
                 if pick is None:
-                    log.append(f"⚠️ AI जाँच नहीं हो सकी ({reason}); पहली मेल खाती तस्वीर ली")
+                    log.append(f"⚠️ AI जाँच नहीं हो सकी ({reason}); पहली नियमों पर खरी तस्वीर ली")
                     pick = 1
                 elif pick == 0:
                     log.append(f"🧐 AI जाँच ने सब तस्वीरें नकारीं: {reason}")
@@ -1143,6 +1380,26 @@ def smart_photo(queries, save_path, folder, tag, px_key, web_on, anchor,
                     log.append(f"🧐 AI जाँच ने तस्वीर {pick} चुनी: {reason}")
 
             path_, src_, url_ = found[pick - 1]
+            try:
+                h = ahash_file(path_)
+            except Exception:
+                h = None
+            dup = False
+            if rules is not None and h is not None:
+                with _HASH_LOCK:  # साथ-साथ चलती खोजें एक ही फोटो दो दृश्यों में न लगा दें
+                    if is_dup(h, rules["hashes"]):
+                        dup = True
+                    else:
+                        rules["hashes"].append(h)
+            if dup:
+                log.append("♻️ यह फोटो किसी और दृश्य में पहले लग चुकी है, छोड़ दी")
+                for f_ in found:
+                    try:
+                        os.remove(f_[0])
+                    except Exception:
+                        pass
+                continue
+
             shutil.copy(path_, save_path)
             used.add(url_)
             for f_ in found:
@@ -1153,6 +1410,30 @@ def smart_photo(queries, save_path, folder, tag, px_key, web_on, anchor,
             return src_ + (" ✔ AI जाँच" if gem and pick else ""), q
     return None, None
 
+
+def ai_verified(prompt, path, size, err, gem, rules, topic, scene_en):
+    """सही विषय की AI तस्वीर: बनवाकर Gemini से जँचवाता है; ग़लत/दोहराई हो तो दोबारा बनवाता है।"""
+    for _ in range(2):
+        if not prompt or not ai_image(prompt, path, size, err):
+            return False
+        try:
+            h = ahash_file(path)
+        except Exception:
+            continue
+        if rules is not None and is_dup(h, rules["hashes"]):
+            _note(err, "AI तस्वीर पहले जैसी निकली")
+            continue
+        if gem:
+            pick, why = gemini_vision_pick(
+                gem["key"], gem["models"], topic, scene_en, prompt[:80], [path], True, rules)
+            if pick == 0:
+                _note(err, "AI तस्वीर विषय से मेल नहीं खाई: " + why)
+                continue
+        if rules is not None:
+            with _HASH_LOCK:
+                rules["hashes"].append(h)
+        return True
+    return False
 
 
 # ---------------------------------------------------------------- आवाज़
@@ -1327,8 +1608,37 @@ def ass_time(t):
     return f"{hh}:{mm:02d}:{ss:02d}.{cs % 100:02d}"
 
 
+def card_markup(text, w, h, accent):
+    """टेक्स्ट कार्ड के शब्द: बड़े अक्षर, कई पंक्तियाँ, सबसे लंबा शब्द रंगीन।"""
+    words = (text or "").replace("\\", "").replace("{", "(").replace("}", ")").upper().split()
+    per = 10 if h > w else (13 if h == w else 18)
+    lines, cur = [], ""
+    for wd in words:
+        if cur and len(cur) + 1 + len(wd) > per:
+            lines.append(cur)
+            cur = wd
+        else:
+            cur = (cur + " " + wd).strip()
+    if cur:
+        lines.append(cur)
+    lines = lines[:4]
+    hl = max(words, key=len) if words else ""
+    done, out = False, []
+    for ln in lines:
+        parts = []
+        for wd in ln.split():
+            if not done and wd == hl:
+                parts.append("{\\c" + accent + "}" + wd + "{\\c&H00FFFFFF&}")
+                done = True
+            else:
+                parts.append(wd)
+        out.append(" ".join(parts))
+    return "\\N".join(out)
+
+
 def write_ass(path, cues, size, font_path, size_ratio, lead,
-              title=None, title_style="pop", title_pos="top", title_end=3.4):
+              title=None, title_style="pop", title_pos="top", title_end=3.4,
+              card=None, card_idx=0, total=0.0):
     w, h = size
     family, is_bold = font_info(font_path)
     if not family:
@@ -1338,6 +1648,9 @@ def write_ass(path, cues, size, font_path, size_ratio, lead,
     outline = max(2, fontsize // 14)
     margin_v = int(h * (0.14 if h > w else 0.09))
     margin_lr = int(w * 0.07)
+    cs = int(min(w, h) * (0.15 if h > w else 0.16))
+    cout = max(3, cs // 16)
+    bold = 0 if is_bold else -1
 
     lines = [
         "[Script Info]",
@@ -1353,17 +1666,30 @@ def write_ass(path, cues, size, font_path, size_ratio, lead,
         "ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, "
         "Alignment, MarginL, MarginR, MarginV, Encoding",
         f"Style: Default,{family},{fontsize},&H00FFFFFF,&H000000FF,"
-        f"&H00000000,&H80000000,{0 if is_bold else -1},0,0,0,100,100,0,0,1,"
+        f"&H00000000,&H80000000,{bold},0,0,0,100,100,0,0,1,"
         f"{outline},2,2,{margin_lr},{margin_lr},{margin_v},1",
         f"Style: Title,{family},{int(fontsize * 1.35)},&H0000E0FF,&H000000FF,"
-        f"&H00000000,&H80000000,{0 if is_bold else -1},0,0,0,100,100,0,0,1,"
+        f"&H00000000,&H80000000,{bold},0,0,0,100,100,0,0,1,"
         f"{outline + 1},3,{8 if title_pos == 'top' else 5},{margin_lr},{margin_lr},"
         f"{int(h * 0.10)},1",
+        f"Style: Card,{family},{cs},&H00FFFFFF,&H000000FF,"
+        f"&H00000000,&H96000000,{bold},0,0,0,100,100,2,0,1,"
+        f"{cout},4,5,{margin_lr},{margin_lr},0,1",
         "",
         "[Events]",
         "Format: Layer, Start, End, Style, Name, MarginL, MarginR, "
         "MarginV, Effect, Text",
     ]
+
+    if card and card.strip():
+        accent = CARD_ACCENT[card_idx % len(CARD_ACCENT)][1]
+        body = card_markup(card, w, h, accent)
+        ms = int(max(1.0, total) * 1000)
+        anim = (r"{\fad(250,200)\fscx88\fscy88\t(0,400,\fscx100\fscy100)"
+                r"\t(400," + str(ms) + r",\fscx106\fscy106)}")
+        lines.append(
+            f"Dialogue: 0,{ass_time(0.0)},{ass_time(total + 0.5)},Card,,0,0,0,,{anim}{body}"
+        )
 
     for start, end, text in cues:
         clean = text.replace("\\", "").replace("{", "(").replace("}", ")")
@@ -1459,7 +1785,8 @@ def compose(src, k, ww, hh):
 
 def make_clip(image, prev, prev_effect, audio, voice_len, cues, out, size,
               effect, transition, ffmpeg, font, size_ratio, folder,
-              pad, is_last, title="", title_style="pop", title_pos="top", video=None):
+              pad, is_last, title="", title_style="pop", title_pos="top", video=None,
+              card_text=None, card_idx=0):
     w, h = size
     total = LEAD + voice_len + pad
     frames = max(1, math.ceil(total * FPS))
@@ -1502,7 +1829,7 @@ def make_clip(image, prev, prev_effect, audio, voice_len, cues, out, size,
 
     post = f"[{base}]eq=contrast=1.05:saturation=1.12,vignette"
 
-    if (cues or (title and title.strip())) and font:
+    if (cues or (title and title.strip()) or card_text) and font:
         ass_path = os.path.join(
             folder, f"cap_{hashlib.md5(out.encode()).hexdigest()[:8]}.ass"
         )
@@ -1510,6 +1837,7 @@ def make_clip(image, prev, prev_effect, audio, voice_len, cues, out, size,
             ass_path, cues or [], size, font, size_ratio, LEAD,
             title=title, title_style=title_style, title_pos=title_pos,
             title_end=max(1.0, min(total - 0.3 - LEAD, 3.4)),
+            card=card_text, card_idx=card_idx, total=total,
         ):
             fdir = os.path.dirname(font)
             post += f",ass=filename='{ass_path}':fontsdir='{fdir}'"
@@ -1622,6 +1950,7 @@ def load_saved_projects(jobs):
             with open(path, encoding="utf-8") as f:
                 data = json.load(f)
             data["used"] = set(data.get("used", []))
+            data["hashes"] = list(data.get("hashes", []))
             data["size"] = tuple(data.get("size") or (720, 1280))
             for sc in data.get("scenes", []):
                 sc["cues"] = [tuple(c) for c in sc.get("cues", [])]
@@ -1689,7 +2018,7 @@ def publish_static(P, path):
 
 
 def draft_job(P, cfg):
-    """आवाज़, तस्वीर-योजना और तस्वीरें तैयार करता है। रुकने पर वहीं से आगे बढ़ सकता है।"""
+    """आवाज़, कहानी की समझ, तस्वीर-योजना और तस्वीरें तैयार करता है। रुकने पर वहीं से आगे बढ़ सकता है।"""
     try:
         folder = P["folder"]
         ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
@@ -1715,6 +2044,7 @@ def draft_job(P, cfg):
                 vlen = audio_duration(vpath, ffmpeg)
                 scenes.append({
                     "text": text,
+                    "headline": auto_headline(text),
                     "voice_path": vpath,
                     "voice_len": vlen,
                     "cues": build_cues(text, bounds, vlen),
@@ -1723,6 +2053,7 @@ def draft_job(P, cfg):
                     "image": None,
                     "source": "",
                     "query": "",
+                    "kind": "",
                     "effect": "Default",
                     "transition": "Default",
                     "keep": True,
@@ -1739,22 +2070,31 @@ def draft_job(P, cfg):
 
         texts = [sc["text"] for sc in scenes]
 
-        # 2) विषय और योजना (बनी हुई हो तो वही)
+        # 2) कहानी की समझ (विषय, दौर, पुरुष/महिला, कितनी नई फोटो) और हर दृश्य की योजना
         extra = cfg["extra_topic"].strip()
         if not P.get("planned"):
-            set_state(P, "कहानी का विषय और हर दृश्य की योजना बन रही है...", 26)
+            set_state(P, "पूरी कहानी पढ़कर विषय, तारीख और पुरुष/महिला तय हो रहे हैं...", 26)
+            key = cfg["gemini_key"]
             topic = extra or translate_hi_en(P["script"], 600) or P["script"][:200]
             anchor = extra
             plans = [None] * n
             era = ""
-            if cfg["gemini_key"]:
+            ctx = {}
+            if key:
+                g_models, _ = gemini_models(key)
+                data, aerr = analyze_story(P["script"], extra, key, g_models or GEMINI_MODELS)
+                if data:
+                    ctx = normalize_ctx(data)
+                    topic = extra or ctx.get("topic_en") or topic
+                    anchor = anchor or ctx.get("anchor", "")
+                set_state(P, "हर दृश्य की फोटो-योजना बन रही है...", 28)
                 g_anchor, plans, err, era = plan_with_ai(
-                    texts, P["script"], cfg["gemini_key"]
+                    texts, P["script"], key, ctx=ctx, topic=topic, anchor=anchor
                 )
                 if not any(plans):
                     P["note"] = (
                         "Gemini से योजना नहीं बन सकी, सामान्य तरीका इस्तेमाल हुआ। "
-                        f"कारण: {err}"
+                        f"कारण: {err or aerr}"
                     )
                 anchor = anchor or g_anchor
             if not anchor:
@@ -1764,10 +2104,38 @@ def draft_job(P, cfg):
             modern = era.startswith("modern") if era else guess_modern(
                 topic, P["script"], extra
             )
+            blob = f"{topic} {anchor} {extra} {P['script'][:1500]}"
+
+            gender = cfg.get("gender", "auto")
+            if gender == "auto":
+                gender = ctx.get("gender", "none") if ctx else guess_gender(blob)
+
             fresh_code = cfg.get("fresh", "auto")
-            tl = ("m" if modern else "") if fresh_code == "auto" else fresh_code
+            rec = ctx.get("recency", "")
+            if fresh_code == "auto":
+                tl = REC_TO_TL[rec] if rec else ("m" if modern else "")
+            else:
+                tl = fresh_code
+            yf = (TODAY - datetime.timedelta(days=TL_DAYS[tl])).year if tl else None
+            if fresh_code == "auto" and rec == "3y":
+                yf = TODAY.year - 3
+
+            must = list(ctx.get("must_any") or [])
+            for wd in re.findall(r"[a-z]{3,}", f"{anchor} {extra}".lower()):
+                if wd not in must and wd not in STOPWORDS:
+                    must.append(wd)
+            ctx = dict(ctx)
+            ctx.update(gender=gender or "none", must_any=must[:10],
+                       off_topic=list(ctx.get("off_topic") or []))
+
+            for sc_, pl in zip(scenes, plans):
+                hl = str((pl or {}).get("headline") or "").strip()
+                if hl:
+                    sc_["headline"] = hl
+
             P.update(anchor=anchor, topic=topic, modern=modern or bool(tl),
-                     plans=plans, planned=True, timelimit=tl)
+                     plans=plans, planned=True, timelimit=tl, year_from=yf,
+                     ctx=ctx, domain_ex=domain_excludes(blob))
             save_project(P)
 
         anchor, topic, modern = P["anchor"], P["topic"], P["modern"]
@@ -1780,8 +2148,9 @@ def draft_job(P, cfg):
             g_models, _ = gemini_models(cfg["gemini_key"])
             gem = {"key": cfg["gemini_key"], "models": g_models or GEMINI_MODELS}
 
-        # 3) तस्वीरें: पहले सब दृश्यों की खोज साथ-साथ (तेज़), फिर बचे हुए के लिए AI
+        # 3) तस्वीरें: पहले सब दृश्यों की खोज साथ-साथ (तेज़), फिर बचे हुए के लिए AI / टेक्स्ट कार्ड
         used = P["used"]
+        hashes = P.setdefault("hashes", [])
         uploads = cfg["uploads"]
         lib = P.setdefault("library", [])
 
@@ -1792,32 +2161,44 @@ def draft_job(P, cfg):
             path = os.path.join(folder, f"scene_{i}_0.jpg")
             if i < len(uploads):
                 shutil.copy(uploads[i], path)
-                sc.update(image=path, source="आपकी तस्वीर", query="")
+                sc.update(image=path, source="आपकी तस्वीर", query="", kind="photo")
+                try:
+                    hashes.append(ahash_file(path))
+                except Exception:
+                    pass
                 lib.append({"path": path, "label": "आपकी तस्वीर"})
                 continue
             todo.append(i)
+
+        def scene_plan(i):
+            plan = plans[i] if i < len(plans) else None
+            qs, exclude = [], []
+            if plan:
+                raw = plan.get("queries")
+                if not isinstance(raw, list):
+                    raw = [plan.get("query")] if plan.get("query") else []
+                qs = [with_anchor(str(q).strip(), anchor) for q in raw if str(q or "").strip()][:2]
+                ex = plan.get("exclude") or []
+                exclude = [str(e) for e in ex] if isinstance(ex, list) else []
+                if qs and anchor and anchor not in qs:
+                    qs.append(anchor)
+            return plan, qs, exclude
 
         def search_scene(i):
             sc = scenes[i]
             path = os.path.join(folder, f"scene_{i}_0.jpg")
             log = []
-            plan = plans[i] if i < len(plans) else None
-            english, exclude = "", []
-            if plan and plan.get("query"):
-                q = str(plan["query"]).strip()
-                queries = [with_anchor(q, anchor)]
-                if anchor:
-                    queries.append(anchor)
-                ex = plan.get("exclude") or []
-                exclude = [str(e) for e in ex] if isinstance(ex, list) else []
-            else:
+            plan, queries, exclude = scene_plan(i)
+            english = ""
+            if not queries:
                 queries, english = scene_queries(sc["text"], topic, anchor)
             if not english:
                 english = translate_hi_en(sc["text"])
+            rules = make_rules(P, exclude, vision=bool(gem))
             source, query = smart_photo(
                 queries, path, folder, f"s{i}", cfg["pixabay_key"], cfg["use_web"],
                 anchor, modern, tl, gem, english or sc["text"], topic,
-                exclude, log, used,
+                exclude, log, used, rules=rules,
             )
             return {"i": i, "path": path, "source": source, "query": query,
                     "log": log, "plan": plan, "english": english,
@@ -1834,7 +2215,7 @@ def draft_job(P, cfg):
                         found[r["i"]] = r
                         done_n += 1
                         set_state(
-                            P, f"तस्वीरें खोज रहे हैं: {done_n}/{len(todo)}",
+                            P, f"सही तस्वीरें खोज रहे हैं: {done_n}/{len(todo)}",
                             27 + done_n / len(todo) * 45,
                         )
                 except BaseException:
@@ -1842,49 +2223,46 @@ def draft_job(P, cfg):
                         f_.cancel()
                     raise
 
-        last_good = None
         for i, sc in enumerate(scenes):
             if i not in found:
-                if sc.get("image") and os.path.exists(sc["image"]):
-                    last_good = sc["image"]
                 continue
 
             r = found[i]
             path, source, query = r["path"], r["source"], r["query"]
             log, plan, english, exclude = r["log"], r["plan"], r["english"], r["exclude"]
             ai_err = []
+            rules = make_rules(P, exclude, vision=bool(gem))
             set_state(P, f"बाकी तस्वीरें पूरी कर रहे हैं: दृश्य {i + 1}/{n}",
                       72 + (i + 1) / n * 26)
 
             if not source and cfg["use_ai"]:
-                set_state(P, f"मेल खाती तस्वीर नहीं मिली, AI से बना रहे हैं: दृश्य {i + 1}")
+                set_state(P, f"मेल खाती असली फोटो नहीं मिली, सही विषय की AI फोटो बना रहे हैं: दृश्य {i + 1}")
                 if plan and plan.get("ai"):
                     prompt = str(plan["ai"])
                 else:
                     prompt = visual_prompt(sc["text"], topic, anchor, english)
-                if prompt and ai_image(prompt, path, size, ai_err):
+                if prompt and ai_verified(prompt, path, size, ai_err, gem, rules,
+                                          topic, english or sc["text"]):
                     source, query = "AI", prompt[:120]
                 elif not prompt:
                     ai_err.append("दृश्य का तस्वीर-विवरण नहीं बन सका")
 
-            if not source and anchor:
+            if not source and gem and anchor:
                 set_state(P, f"विषय से जुड़ी सामान्य तस्वीर खोज रहे हैं: दृश्य {i + 1}")
-                source, query = find_photo(
-                    [anchor], path, used, cfg["pixabay_key"], cfg["use_web"],
-                    anchor, exclude=exclude, modern=modern, relaxed=True,
-                    log=log, timelimit=tl,
+                source, query = smart_photo(
+                    [anchor], path, folder, f"g{i}", cfg["pixabay_key"], cfg["use_web"],
+                    anchor, modern, tl, gem, english or sc["text"], topic,
+                    exclude, log, used, rules=rules,
                 )
 
             if source:
-                sc.update(image=path, source=source, query=query)
-                last_good = path
-                P.setdefault("good", []).append(path)
+                sc.update(image=path, source=source, query=query,
+                          kind="ai" if source == "AI" else "photo")
                 lib.append({"path": path, "label": f"{source}: {query[:40]}"})
             else:
-                label = make_fallback_image(
-                    path, size, P.get("good"), avoid=last_good, title=anchor
-                )
-                sc.update(image=path, source=label, query="")
+                # कभी सादा रंग या पुरानी तस्वीर नहीं: दृश्य के शब्द बड़े अक्षरों में दिखेंगे
+                make_fallback_image(path, size)
+                sc.update(image=path, source="टेक्स्ट कार्ड", query="", kind="card")
                 P.setdefault("missing", []).append(i + 1)
 
             if ai_err and sc["source"] != "AI":
@@ -1894,8 +2272,9 @@ def draft_job(P, cfg):
 
         if P.get("missing"):
             P["note"] = (P.get("note", "") +
-                         f" इन दृश्यों की मेल खाती तस्वीर नहीं मिली: {sorted(set(P['missing']))}। "
-                         "इनमें पहले की तस्वीर या रंगीन पृष्ठभूमि लगी है। "
+                         f" इन दृश्यों की सही, मेल खाती फोटो नहीं मिली: {sorted(set(P['missing']))}। "
+                         "इनमें दृश्य के शब्द बड़े अक्षरों में टेक्स्ट कार्ड की तरह दिखेंगे। "
+                         "एडिटर में 'नई फोटो खोजो' या अपनी फोटो लगा सकते हैं। "
                          "कारण जानने के लिए 'तस्वीर कैसे चुनी गई' खोलें।").strip()
 
         P["draft_done"] = True
@@ -1926,6 +2305,13 @@ def resolve_effects(kept, off, default_effect, default_transition):
     return effects, trans
 
 
+def card_text_for(sc, font):
+    """टेक्स्ट कार्ड वाले दृश्य के लिए बड़े अक्षरों का वाक्यांश (वरना None)।"""
+    if font and sc.get("kind") == "card" and not sc.get("video"):
+        return (sc.get("headline") or auto_headline(sc["text"])) or None
+    return None
+
+
 def preview_clip(P, sel, size, default_effect, default_transition, captions, cap_ratio):
     """एक दृश्य की छोटी झलक (कम क्वालिटी, जल्दी बनती है)।"""
     ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
@@ -1938,15 +2324,16 @@ def preview_clip(P, sel, size, default_effect, default_transition, captions, cap
     sc = kept[pos]
     prev = (kept[pos - 1].get("end_image") or kept[pos - 1]["image"]) if pos > 0 else None
     prev_eff = effects[pos - 1] if pos > 0 else None
-    font = get_caption_font() if captions else None
+    font = get_caption_font() if (captions or sc.get("kind") == "card") else None
     out = os.path.join(P["folder"], f"preview_{int(time.time() * 1000) % 10**9}.mp4")
     make_clip(
         sc["image"], prev, prev_eff, sc["voice_path"], sc["voice_len"],
-        sc["cues"] if font else None, out, size, effects[pos], trans[pos],
+        sc["cues"] if (font and captions) else None, out, size, effects[pos], trans[pos],
         ffmpeg, font, cap_ratio, P["folder"], sc["pad"], False,
         title=(sc.get("title") or "").strip(),
         title_style=sc.get("title_style", "pop"),
         title_pos=sc.get("title_pos", "top"), video=sc.get("video"),
+        card_text=card_text_for(sc, font), card_idx=card_idx_for(sc["image"]),
     )
     return out
 
@@ -1964,10 +2351,12 @@ def render_job(P, cfg):
             raise RuntimeError("कम से कम एक दृश्य रखना ज़रूरी है।")
 
         font = None
-        if cfg["captions"]:
+        need_font = cfg["captions"] or any(s.get("kind") == "card" for s in kept)
+        if need_font:
             font = get_caption_font()
             if not font:
-                P["note"] = "कैप्शन के लिए हिंदी फ़ॉन्ट नहीं मिला, इसलिए वीडियो बिना कैप्शन के बना।"
+                P["note"] = ("हिंदी फ़ॉन्ट नहीं मिला, इसलिए कैप्शन और टेक्स्ट कार्ड के "
+                             "शब्द वीडियो में नहीं दिखेंगे।")
 
         off = P.get("offset", 0)
 
@@ -1981,20 +2370,25 @@ def render_job(P, cfg):
             prev = (kept[idx - 1].get("end_image") or kept[idx - 1]["image"]) if idx > 0 else None
             prev_eff = effects[idx - 1] if idx > 0 else None
             title = (sc.get("title") or "").strip()
+            cues = sc["cues"] if (font and cfg["captions"]) else None
+            card = card_text_for(sc, font)
+            cidx = card_idx_for(sc["image"])
             sig = repr((
                 sc["image"], os.path.getmtime(sc["image"]),
                 prev, prev_eff, effects[idx], trans[idx] if prev else "",
                 sc["voice_path"], os.path.getmtime(sc["voice_path"]),
-                sc["cues"] if font else None, font, size,
+                cues, font, size,
                 cfg["cap_ratio"], sc["pad"], idx == n - 1,
                 title, sc.get("title_style"), sc.get("title_pos"),
                 sc.get("video"),
                 os.path.getmtime(sc["video"]) if sc.get("video") and os.path.exists(sc["video"]) else 0,
+                card, cidx,
             ))
             key = hashlib.md5(sig.encode()).hexdigest()[:16]
             plan_jobs.append({
                 "idx": idx, "sc": sc, "prev": prev, "prev_eff": prev_eff,
                 "effect": effects[idx], "trans": trans[idx], "title": title,
+                "cues": cues, "card": card, "cidx": cidx,
                 "clip": os.path.join(folder, f"clip_{key}.mp4"),
             })
 
@@ -2006,11 +2400,12 @@ def render_job(P, cfg):
             tmp = j["clip"] + ".part.mp4"
             make_clip(
                 sc["image"], j["prev"], j["prev_eff"], sc["voice_path"],
-                sc["voice_len"], sc["cues"] if font else None, tmp,
+                sc["voice_len"], j["cues"], tmp,
                 size, j["effect"], j["trans"], ffmpeg, font,
                 cfg["cap_ratio"], folder, sc["pad"], j["idx"] == n - 1,
                 title=j["title"], title_style=sc.get("title_style", "pop"),
                 title_pos=sc.get("title_pos", "top"), video=sc.get("video"),
+                card_text=j["card"], card_idx=j["cidx"],
             )
             os.replace(tmp, j["clip"])
 
@@ -2106,7 +2501,8 @@ def new_scene(P, text, image, source="आपकी तस्वीर", query=""
         "cues": cues, "pad": 0.35, "image": image, "source": source,
         "query": query, "effect": "Default", "transition": "Default",
         "keep": True, "title": "", "title_style": "pop", "title_pos": "top",
-        "log": [],
+        "log": [], "headline": auto_headline(text),
+        "kind": "card" if str(source).startswith("खाली") else "photo",
     }
 
 
@@ -2155,7 +2551,7 @@ def import_video(P, src_path, text="", start=0.0, length=60.0, keep_audio=True):
         capture_output=True, timeout=120,
     )
     if not os.path.exists(thumb):
-        make_fallback_image(thumb, P.get("size", (720, 1280)), [], None, title="VIDEO")
+        make_fallback_image(thumb, P.get("size", (720, 1280)))
     if not os.path.exists(endf):
         shutil.copy(thumb, endf)
 
@@ -2185,7 +2581,7 @@ def import_video(P, src_path, text="", start=0.0, length=60.0, keep_audio=True):
         "cues": cues, "pad": 0.2, "image": thumb, "end_image": endf, "video": norm,
         "source": "आपका वीडियो", "query": "", "effect": "Default",
         "transition": "Default", "keep": True, "title": "", "title_style": "pop",
-        "title_pos": "top", "log": [],
+        "title_pos": "top", "log": [], "kind": "video", "headline": "",
     }
 
 
@@ -2196,7 +2592,6 @@ def start_thread(fn, P, cfg):
 
 
 # ==== UI ====
-import base64
 import copy
 
 QUALITIES = ["HD 1080p (बेहतर, धीमा)", "सामान्य 720p (तेज़)"]
@@ -2243,6 +2638,2695 @@ DEFAULTS = {
     "format_name": list(FORMATS.keys())[0], "quality": QUALITIES[0], "max_chars": 110,
     "use_web": True, "use_ai": True, "extra_topic": "",
     "fresh_name": "🤖 अपने आप (विषय देखकर)", "verify": True,
+    "gender_name": "अपने-आप पहचाने",
+    "captions_on": True, "cap_name": "मध्यम",
+    "effect_choice": "Auto (हर दृश्य में अलग)", "transition_choice": "Auto (हर दृश्य अलग)",
+    "gemini_key": "", "pixabay_key": "",
+}
+S = st.session_state.setdefault("S", dict(DEFAULTS))
+for _k, _v in DEFAULTS.items():
+    S.setdefault(_k, _v)
+
+
+def secret(name):
+    """Streamlit के Secrets में एक बार रखी key पढ़ता है (GitHub में नहीं दिखती)।"""
+    try:
+        return str(st.secrets.get(name, "")).strip()
+    except Exception:
+        return ""
+
+
+def secret_names():
+    try:
+        return list(st.secrets.keys())
+    except Exception:
+        return []
+
+
+def eff_gemini():
+    return S["gemini_key"].strip() or secret("GEMINI_API_KEY")
+
+
+def eff_pixabay():
+    return S["pixabay_key"].strip() or secret("PIXABAY_API_KEY")
+
+
+def get_thumb(path):
+    """छोटी झलक बनाकर रखें, ताकि टाइमलाइन तेज़ खुले।"""
+    try:
+        tp = path + ".thumb.jpg"
+        if not os.path.exists(tp):
+            with Image.open(path) as im:
+                im = to_rgb(im)
+                im.thumbnail((240, 240))
+                im.save(tp, "JPEG", quality=80)
+        return tp
+    except Exception:
+        return path
+
+
+def logo_b64():
+    try:import streamlit as st
+import requests
+import subprocess
+import tempfile
+import os
+import re
+import json
+import asyncio
+import random
+import io
+import math
+import shutil
+import time
+import threading
+import base64
+import hashlib
+import datetime
+from urllib.parse import quote
+from PIL import Image, ImageDraw, ImageFilter, ImageChops, ImageFont, ImageOps, ImageStat
+import edge_tts
+import imageio_ffmpeg
+
+try:
+    import pillow_heif
+    pillow_heif.register_heif_opener()
+except Exception:
+    pass
+
+# requirements.txt:
+# streamlit
+# requests
+# pillow
+# edge-tts
+# imageio-ffmpeg
+# deep-translator
+# ddgs
+# pillow-heif
+#
+# packages.txt (हिंदी कैप्शन और टेक्स्ट कार्ड के फ़ॉन्ट के लिए, Streamlit Cloud पर):
+# fonts-noto-core
+#
+# .streamlit/config.toml (सीधे डाउनलोड लिंक के लिए):
+# [server]
+# enableStaticServing = true
+
+try:
+    from deep_translator import GoogleTranslator
+except Exception:
+    GoogleTranslator = None
+
+try:
+    from ddgs import DDGS
+except Exception:
+    try:
+        from duckduckgo_search import DDGS
+    except Exception:
+        DDGS = None
+
+_APP_DIR = os.path.dirname(os.path.abspath(__file__)) if "__file__" in globals() else "."
+LOGO_PATH = os.path.join(_APP_DIR, "logo.png")
+
+st.set_page_config(
+    page_title="Ravi Studio - AI वीडियो क्रिएटर",
+    page_icon=LOGO_PATH if os.path.exists(LOGO_PATH) else "🎬",
+    layout="centered",
+    initial_sidebar_state="collapsed",
+)
+
+TODAY = datetime.date.today()
+
+VOICES = {
+    "हिंदी पुरुष": "hi-IN-MadhurNeural",
+    "हिंदी महिला": "hi-IN-SwaraNeural"
+}
+
+FORMATS = {
+    "YouTube Shorts (9:16)": (720, 1280),
+    "Landscape (16:9)": (1280, 720),
+    "Square (1:1)": (720, 720)
+}
+
+EFFECTS = [
+    "Zoom In", "Zoom Out", "Pan Left to Right", "Pan Right to Left",
+    "Pan Up", "Pan Down", "Drift Zoom", "Handheld",
+]
+
+TRANSITIONS = [
+    "fade", "slideleft", "wipeleft", "circleopen", "dissolve",
+    "smoothright", "slideup", "radial", "zoomin", "slidedown",
+    "wiperight", "fadewhite",
+]
+
+FPS = 24
+LEAD = 0.25    # नई तस्वीर आने के बाद आवाज़ शुरू होने में देरी
+PAD = 0.35     # दृश्य के अंत में ठहराव
+TRANS = 0.5    # दृश्यों के बीच ट्रांज़िशन की अवधि
+GEMINI_MODELS = ["gemini-3.5-flash", "gemini-3.5-flash-lite", "gemini-3-flash-preview"]
+HEADERS = {"User-Agent": "RaviAIVideoCreator/10.0 (personal video project)"}
+APP_VERSION = "Ravi Studio • संस्करण 10"
+
+CAPTION_SIZES = {"छोटा": 0.050, "मध्यम": 0.066, "बड़ा": 0.082}
+
+FONT_PATHS = [
+    "/usr/share/fonts/truetype/noto/NotoSansDevanagari-Bold.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSansDevanagari-Regular.ttf",
+    "/usr/share/fonts/opentype/noto/NotoSansDevanagari-Bold.ttf",
+    "/usr/share/fonts/truetype/lohit-devanagari/Lohit-Devanagari.ttf",
+    "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf",
+    "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
+]
+FONT_URLS = [
+    "https://github.com/google/fonts/raw/main/ofl/hind/Hind-Bold.ttf",
+    "https://github.com/google/fonts/raw/main/ofl/mukta/Mukta-Bold.ttf",
+]
+
+GENDER_LABELS = {
+    "अपने-आप पहचाने": "auto",
+    "पुरुष (Men's)": "men",
+    "महिला (Women's)": "women",
+    "दोनों / कोई फ़र्क नहीं": "none",
+}
+
+# Gemini के "कितनी नई फोटो" जवाब को समय-सीमा कोड में बदलना, और हर कोड के लिए कितने दिन पीछे का साल मान्य
+REC_TO_TL = {"week": "w", "month": "m", "year": "y", "3y": "y", "any": ""}
+TL_DAYS = {"d": 3, "w": 9, "m": 40, "y": 370}
+TL_TEXT = {
+    "d": "taken today or yesterday (very recent news photo)",
+    "w": "taken within the last few days (recent news photo)",
+    "m": "taken within the last month",
+    "y": "taken within the last year",
+    "": "any date",
+}
+
+# ग़लत विषय की फोटो रोकने के लिए: (विषय पहचानने वाले शब्द, उस विषय में ग़लत मानी जाने वाली चीज़ें)
+DOMAINS = [
+    (("cricket", "क्रिकेट", "odi", "t20", "ipl", "bcci", "wicket"),
+     ["wwe", "wrestling", "wrestler", "football", "soccer", "fifa", "nba", "basketball",
+      "nfl", "rugby", "tennis", "golf", "hockey", "baseball", "boxing", "ufc", "mma",
+      "badminton", "kabaddi", "chess", "formula"]),
+    (("football", "soccer", "फुटबॉल", "fifa"),
+     ["cricket", "wwe", "wrestling", "nba", "tennis", "golf", "baseball", "rugby", "kabaddi"]),
+    (("tennis", "टेनिस"),
+     ["cricket", "wwe", "wrestling", "football", "soccer", "nba", "golf", "baseball"]),
+    (("wwe", "wrestling", "कुश्ती"),
+     ["cricket", "football", "soccer", "nba", "tennis", "golf"]),
+]
+
+STOP_HI = set(
+    "है हैं था थी थे हो हुआ हुई हुए की के का को में से पर और या कि जो यह वह इस उस ने भी "
+    "तो ही एक कर करने किया गया गई गए रहा रही रहे लिए साथ बाद तक".split()
+)
+
+# टेक्स्ट कार्ड के रंग: (गहरा, मध्य, चमक) पृष्ठभूमि और (हाइलाइट RGB, ASS रंग)
+CARD_BG = [
+    ("#0b132b", "#1c2541", "#3a506b"),
+    ("#1a0b2e", "#3d1a78", "#6a0572"),
+    ("#0f2027", "#203a43", "#2c5364"),
+    ("#200122", "#6f0000", "#a4133c"),
+    ("#04293a", "#064663", "#0b7a75"),
+]
+CARD_ACCENT = [
+    ("#FFD700", "&H0000D7FF&"),
+    ("#00E5FF", "&H00FFE500&"),
+    ("#FF4081", "&H008140FF&"),
+    ("#69F0AE", "&H00AEF069&"),
+    ("#FF9100", "&H000091FF&"),
+]
+
+_HASH_LOCK = threading.Lock()
+
+
+# ---------------------------------------------------------------- दृश्य बाँटना
+def chunk_sentences(text, limit):
+    sentences = re.split(r"(?<=[।!?\.])\s+", text.strip())
+    chunks, current = [], ""
+    for s in sentences:
+        if current and len(current) + len(s) + 1 > limit:
+            chunks.append(current.strip())
+            current = s
+        else:
+            current = (current + " " + s).strip()
+    if current:
+        chunks.append(current.strip())
+    return chunks
+
+
+def split_scenes(text, limit):
+    paragraphs = [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
+    if not paragraphs:
+        paragraphs = [text.strip()]
+
+    scenes = []
+    for p in paragraphs:
+        if len(p) > limit:
+            scenes.extend(chunk_sentences(p, limit))
+        else:
+            scenes.append(p)
+    return [s for s in scenes if s.strip()]
+
+
+def auto_headline(text, n=5):
+    """दृश्य के अपने शब्दों से बड़े अक्षरों वाला छोटा वाक्यांश (फोटो न मिलने पर स्क्रीन पर दिखेगा)।"""
+    text = (text or "").strip()
+    first = re.split(r"[।!?\.,;:—\n]", text)[0] if text else ""
+    ws = [w.strip("\"'“”‘’()[]") for w in first.split()]
+    ws = [w for w in ws if w and w not in STOP_HI]
+    if len(ws) < 2:
+        ws = [w for w in re.sub(r"[।!?\.,;:—]", " ", text).split() if w not in STOP_HI]
+    return " ".join(ws[:n])
+
+
+# ---------------------------------------------------------------- खोज के शब्द
+STOPWORDS = set("""
+the and for with that this from they them their there were was are been being have has had
+not but his her him she you your our out into over under about after before then than when
+where which while would could should will shall can may might also very more most some any
+such only just said says like what who whom whose why how all each every both few many much
+one two three four five six seven eight nine ten again once here those these its itself
+""".split())
+
+GENERIC = set(
+    "ancient city people photo image picture view history historical old world great".split()
+)
+
+
+def has_word(text, w):
+    return bool(re.search(r"(?<![a-z0-9])" + re.escape(w) + r"(?![a-z0-9])", text))
+
+
+def translate_hi_en(text, limit=1500):
+    if GoogleTranslator is None or not text.strip():
+        return ""
+    try:
+        return GoogleTranslator(source="hi", target="en").translate(
+            text[:limit]
+        ) or ""
+    except Exception:
+        return ""
+
+
+def english_keywords(text):
+    words = re.findall(r"[A-Za-z]+", text or "")
+    keep, seen = [], set()
+    for w in words:
+        lw = w.lower()
+        if len(lw) > 3 and lw not in STOPWORDS and lw not in seen:
+            seen.add(lw)
+            keep.append(w)
+    return keep
+
+
+def parse_json(text):
+    text = re.sub(r"```(?:json)?", "", text).strip()
+    try:
+        return json.loads(text)
+    except Exception:
+        m = re.search(r"\{.*\}", text, re.S)
+        if m:
+            try:
+                return json.loads(m.group(0))
+            except Exception:
+                return None
+    return None
+
+
+def guess_gender(blob):
+    b = (blob or "").lower()
+    w = bool(re.search(r"महिला|women|ladies|female|girls|लड़कियाँ|लड़कियां", b))
+    m = bool(re.search(r"पुरुष|men's|\bmen\b|gents|\bmale\b", b))
+    if w and not m:
+        return "women"
+    if m and not w:
+        return "men"
+    return "none"
+
+
+def domain_excludes(blob):
+    """विषय (जैसे क्रिकेट) पहचानकर दूसरे विषयों (WWE, फुटबॉल...) के शब्द 'ग़लत' सूची में डालता है।"""
+    b = (blob or "").lower()
+    out, own = set(), set()
+    for trig, ex in DOMAINS:
+        if any(has_word(b, t) for t in trig):
+            out |= set(ex)
+            own |= set(trig)
+    return sorted(out - own)
+
+
+def gemini_models(key):
+    """Google से बताए गए उपलब्ध flash मॉडल (नाम बदलते रहते हैं)।"""
+    try:
+        r = requests.get(
+            "https://generativelanguage.googleapis.com/v1beta/models",
+            params={"pageSize": 100},
+            headers={"x-goog-api-key": key},
+            timeout=30,
+        )
+        if r.status_code != 200:
+            return [], f"{r.status_code}: {r.text[:200]}"
+        names = []
+        for m in r.json().get("models", []):
+            n = m.get("name", "").replace("models/", "")
+            low = n.lower()
+            if "generateContent" not in (m.get("supportedGenerationMethods") or []):
+                continue
+            if "flash" not in low:
+                continue
+            if any(x in low for x in (
+                "image", "tts", "live", "audio", "embedding", "thinking",
+                "robotics", "computer", "vision", "learnlm", "gemma",
+            )):
+                continue
+            names.append(n)
+
+        def rank(n):
+            nums = re.findall(r"\d+(?:\.\d+)?", n)
+            v = float(nums[0]) if nums else 0.0
+            return (-v, "lite" in n.lower(), "preview" in n.lower() or "exp" in n.lower())
+
+        names.sort(key=rank)
+        return names[:4], ""
+    except Exception as e:
+        return [], str(e)[:200]
+
+
+def gemini_generate(key, prompt, models):
+    errors = []
+    url = "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent"
+    for model in models:
+        for use_json in (True, False):
+            try:
+                body = {"contents": [{"parts": [{"text": prompt}]}]}
+                if use_json:
+                    body["generationConfig"] = {"responseMimeType": "application/json"}
+                r = requests.post(
+                    url.format(model),
+                    headers={"x-goog-api-key": key, "Content-Type": "application/json"},
+                    json=body,
+                    timeout=90,
+                )
+                if r.status_code == 200:
+                    cands = r.json().get("candidates") or []
+                    if cands:
+                        parts = cands[0].get("content", {}).get("parts", [])
+                        text = "".join(p.get("text", "") for p in parts)
+                        if text.strip():
+                            return text, ""
+                    errors.append(f"{model}: खाली जवाब")
+                    break
+                errors.append(f"{model} {r.status_code}: {r.text[:160]}")
+                if r.status_code == 429:
+                    time.sleep(5)
+                if r.status_code == 400 and use_json and "mime" in r.text.lower():
+                    continue  # JSON मोड नहीं चलता, बिना उसके दोबारा
+                if r.status_code in (400, 401, 403) and "key" in r.text.lower():
+                    return "", " | ".join(errors)[:500]  # key ही गलत है
+                break
+            except Exception as e:
+                errors.append(f"{model}: {str(e)[:100]}")
+                break
+    return "", " | ".join(errors)[:500]
+
+
+def test_gemini(key):
+    models, list_err = gemini_models(key)
+    if not models:
+        if list_err:
+            return False, f"key जाँच में समस्या: {list_err}"
+        models = GEMINI_MODELS
+    text, err = gemini_generate(key, 'Reply with the JSON {"ok": true}', models)
+    if text:
+        return True, f"key सही है ✅ (मॉडल: {models[0]})"
+    return False, f"काम नहीं बना: {err}"
+
+
+def normalize_ctx(d):
+    d = d if isinstance(d, dict) else {}
+    g = str(d.get("gender", "")).lower()
+    g = g if g in ("men", "women") else "none"
+    rec = str(d.get("recency", "")).lower()
+    rec = rec if rec in REC_TO_TL else ""
+    era = "historical" if str(d.get("era", "")).lower().startswith("hist") else "modern"
+
+    def words(v, n):
+        out = []
+        for x in (v if isinstance(v, list) else []):
+            if isinstance(x, str):
+                x = x.strip().lower()
+                if len(x) >= 2 and x not in out:
+                    out.append(x)
+        return out[:n]
+
+    return {
+        "topic_en": str(d.get("topic_en", "")).strip()[:300],
+        "anchor": str(d.get("anchor", "")).strip()[:60],
+        "era": era, "gender": g, "recency": rec,
+        "must_any": words(d.get("must_any"), 8),
+        "off_topic": words(d.get("off_topic"), 14),
+    }
+
+
+def analyze_story(script, extra, key, models):
+    """पूरी कहानी एक बार पढ़कर: विषय, दौर, पुरुष/महिला, कितनी नई फोटो, ज़रूरी/ग़लत शब्द।"""
+    prompt = (
+        "Today's date is " + TODAY.isoformat() + ".\n"
+        "Analyse this Hindi story to choose matching REAL photographs. Reply with ONLY JSON:\n"
+        '{"topic_en":"one English sentence: what the story is about",'
+        '"anchor":"1-3 English words naming the main subject, e.g. India women cricket",'
+        '"era":"modern" or "historical",'
+        '"gender":"men" or "women" or "none" (are the people/teams in the story men or women; '
+        '"none" if mixed or not about people),'
+        '"recency":"week" or "month" or "year" or "3y" or "any" (how recent the photos must be: '
+        '"week" if it is about today\'s or this week\'s event, "any" for history),'
+        '"must_any":[3 to 8 lowercase English words such as team, sport, person and place names; '
+        'a correct photo caption normally contains at least one],'
+        '"off_topic":[up to 12 lowercase English words that signal a WRONG photo for this story, '
+        "such as other sports or unrelated celebrities]}\n"
+        + (f"Main subject given by the user: {extra}\n" if extra else "")
+        + "Story:\n" + script[:2000]
+    )
+    text, err = gemini_generate(key, prompt, models)
+    return (parse_json(text) if text else None), err
+
+
+PLAN_PROMPT = (
+    "You choose real photographs for a Hindi video. Today's date: {today}.\n"
+    "Story: {topic}\nMain subject: {anchor}. People in the story: {gender}. Era: {era}.\n"
+    "Scenes (Hindi), numbered:\n{listing}\n\n"
+    "For EACH scene return:\n"
+    '- "queries": 2 English image-search queries (2-6 words) for a REAL photograph showing '
+    "what this scene says. First = most specific (team/person/place names + what is happening"
+    "{yearhint}), second = safer and broader. Always keep the main subject name; never only "
+    "generic words.\n"
+    '- "ai": ONE detailed English sentence describing the photo to generate if no real photo '
+    "exists: same subject, same men/women, setting, lighting. No text in the image.\n"
+    '- "exclude": 0 to 5 English words that would show a WRONG photo for this scene.\n'
+    '- "headline": 2 to 5 words in Devanagari copied or shortened from the scene itself, the '
+    "key phrase to show as big text if no photo is found.\n"
+    'Also return "anchor" (1-2 word main subject of the whole story) and "era" '
+    '("modern" if the story is about events after 2012, otherwise "historical").\n'
+    'Respond with ONLY JSON: {"anchor":"...","era":"modern","scenes":[{"n":1,'
+    '"queries":["...","..."],"ai":"...","exclude":["..."],"headline":"..."}]}'
+)
+
+
+def plan_with_ai(scenes, opening, key, on_progress=None, ctx=None, topic="", anchor=""):
+    """हर दृश्य के लिए तस्वीर की खोज, AI prompt और टेक्स्ट कार्ड का वाक्यांश, मुफ़्त Gemini से।"""
+    ctx = ctx or {}
+    g_anchor = anchor or ctx.get("anchor", "")
+    era = ctx.get("era", "")
+    plans = [None] * len(scenes)
+    last_error = ""
+    CH = 12
+    models, list_err = gemini_models(key)
+    if not models:
+        models = GEMINI_MODELS
+        last_error = list_err
+    gtxt = {"men": "men (male)", "women": "women (female)"}.get(
+        ctx.get("gender"), "mixed or not specified")
+
+    for start in range(0, len(scenes), CH):
+        chunk = scenes[start:start + CH]
+        listing = "\n".join(
+            f"{start + j + 1}. {s[:300]}" for j, s in enumerate(chunk)
+        )
+        fresh = ctx.get("recency") in ("week", "month", "year")
+        prompt = (
+            PLAN_PROMPT.replace("{today}", TODAY.isoformat())
+            .replace("{topic}", topic or opening[:300])
+            .replace("{anchor}", g_anchor or "unknown")
+            .replace("{gender}", gtxt)
+            .replace("{era}", era or "modern")
+            .replace("{yearhint}", f", add the year {TODAY.year}" if fresh else "")
+            .replace("{listing}", listing)
+        )
+
+        data = None
+        for attempt in range(2):
+            text, err = gemini_generate(key, prompt, models)
+            if err:
+                last_error = err
+            data = parse_json(text) if text else None
+            if data:
+                break
+
+        if on_progress:
+            on_progress(min(start + CH, len(scenes)))
+        time.sleep(1)
+
+        if not data:
+            continue
+
+        g_anchor = g_anchor or str(data.get("anchor", "")).strip()
+        era = era or str(data.get("era", "")).strip().lower()
+        for item in data.get("scenes", []):
+            try:
+                n = int(item.get("n")) - 1
+            except Exception:
+                continue
+            if 0 <= n < len(scenes):
+                plans[n] = item
+
+    return g_anchor, plans, last_error, era
+
+
+def llm_query(scene, topic):
+    """Gemini key न हो तो मुफ़्त text सेवा से कोशिश।"""
+    prompt = (
+        "You pick real photographs for a Hindi story video. "
+        f"Story topic: {topic[:300]}. "
+        f"Scene (Hindi): {scene[:400]}. "
+        "Reply with ONLY one English image-search query of 3 to 6 words "
+        "that would find a real photograph matching this scene and topic. "
+        "No quotes, no explanation."
+    )
+    try:
+        r = requests.get(
+            "https://text.pollinations.ai/" + quote(prompt),
+            params={"model": "openai"},
+            headers=HEADERS,
+            timeout=40,
+        )
+        if r.status_code != 200:
+            return None
+        text = r.text.strip().split("\n")[0].strip(" \"'.")
+        if "{" in text or not (2 <= len(text) <= 80):
+            return None
+        if len(text.split()) > 10:
+            return None
+        return text
+    except Exception:
+        return None
+
+
+def with_anchor(query, anchor):
+    if anchor and anchor.lower() not in query.lower() and len(query.split()) < 4:
+        return f"{anchor} {query}"
+    return query
+
+
+def visual_prompt(scene, topic, anchor, english=""):
+    """दृश्य की कथा से एक ठोस English तस्वीर-विवरण बनाता है (AI तस्वीर के लिए)।"""
+    ask = (
+        "Write ONE English sentence (max 35 words) describing a single realistic "
+        "photograph that illustrates this narration. Be concrete and visual: "
+        "place, objects, setting, lighting. "
+        f"Story topic: {topic[:200]}. "
+        f"Narration (Hindi): {scene[:400]}. "
+        "Reply with only the sentence."
+    )
+    try:
+        r = requests.get(
+            "https://text.pollinations.ai/" + quote(ask),
+            params={"model": "openai"},
+            headers=HEADERS,
+            timeout=40,
+        )
+        if r.status_code == 200:
+            t = r.text.strip().split("\n")[0].strip(" \"'")
+            if 15 <= len(t) <= 300 and "{" not in t:
+                return with_anchor(t, anchor)
+    except Exception:
+        pass
+
+    english = english or translate_hi_en(scene)
+    if english.strip():
+        return with_anchor(english.strip()[:300], anchor)
+    return ""  # विवरण नहीं बना तो बेमतलब तस्वीर नहीं बनाएँगे
+
+
+def scene_queries(scene, topic, anchor):
+    queries = []
+
+    q = llm_query(scene, topic)
+    if q:
+        queries.append(with_anchor(q, anchor))
+
+    english = translate_hi_en(scene)
+    kws = english_keywords(english)
+    if kws:
+        queries.append(with_anchor(" ".join(kws[:3]), anchor))
+
+    if anchor:
+        queries.append(anchor)
+
+    seen, final = set(), []
+    for q in queries:
+        if q and q.lower() not in seen:
+            seen.add(q.lower())
+            final.append(q)
+    return final, english
+
+
+# ---------------------------------------------------------------- मेल की जाँच
+def match_words(query, anchor):
+    words = re.findall(r"[a-z]+", f"{query} {anchor}".lower())
+    strict = {
+        w for w in words
+        if len(w) >= 4 and w not in STOPWORDS and w not in GENERIC
+    }
+    if strict:
+        return strict
+    return {w for w in words if len(w) >= 4 and w not in STOPWORDS}
+
+
+def score_text(text, words):
+    t = (text or "").lower()
+    return sum(1 for w in words if w in t)
+
+
+GENDER_W = re.compile(r"\b(women|women's|womens|woman|female|ladies|girls?)\b", re.I)
+GENDER_M = re.compile(r"\b(men|men's|mens|man|male|boys?|gents)\b", re.I)
+YEAR_RE = re.compile(r"(?<!\d)(19\d\d|20\d\d)(?!\d)")
+DATE8_RE = re.compile(r"(?<!\d)(20\d\d)(?=(?:0[1-9]|1[0-2])[0-3]\d(?!\d))")
+
+
+def gender_ok(text, gender):
+    """पुरुषों की कहानी में महिला वाली और महिलाओं की कहानी में पुरुष वाली फोटो नहीं।"""
+    t = (text or "").replace("’", "'")
+    w, m = bool(GENDER_W.search(t)), bool(GENDER_M.search(t))
+    if gender == "women":
+        return not (m and not w)
+    if gender == "men":
+        return not w
+    return True
+
+
+def years_in(text):
+    t = re.sub(r"\d{3,4}\s*[x×]\s*\d{3,4}", " ", text or "")
+    ys = [int(y) for y in YEAR_RE.findall(t)] + [int(y) for y in DATE8_RE.findall(t)]
+    return [y for y in ys if 2005 <= y <= TODAY.year + 1]
+
+
+def ahash(img):
+    g = img.convert("L").resize((8, 8), Image.LANCZOS)
+    px = list(g.getdata())
+    avg = sum(px) / 64
+    return sum(1 << i for i, p in enumerate(px) if p >= avg)
+
+
+def ahash_file(path):
+    with Image.open(path) as im:
+        return ahash(to_rgb(im))
+
+
+def is_dup(h, hashes, thr=5):
+    return any(bin(h ^ x).count("1") <= thr for x in hashes)
+
+
+def make_rules(P, plan_exclude=None, vision=False):
+    """एक खोज के सारे नियम: पुरुष/महिला, ज़रूरी शब्द, ग़लत शब्द, साल, पहले लग चुकी फोटो।"""
+    ctx = P.get("ctx") or {}
+    tl = P.get("timelimit", "")
+    must = [m for m in (ctx.get("must_any") or []) if m]
+    ex = set(ctx.get("off_topic") or []) | set(P.get("domain_ex") or [])
+    for e in (plan_exclude or []):
+        ex.add(str(e).strip().lower())
+    own = set(must) | set(re.findall(r"[a-z]+", (P.get("anchor") or "").lower()))
+    ex = {e for e in ex if len(e) >= 2 and e not in own}
+    ex_re = (re.compile(r"(?<![a-z0-9])(?:" + "|".join(re.escape(e) for e in sorted(ex))
+                        + r")(?![a-z0-9])") if ex else None)
+    return {
+        "gender": ctx.get("gender", "none"), "must": must, "ex": sorted(ex), "ex_re": ex_re,
+        "year_from": P.get("year_from"), "vision": bool(vision),
+        "rec_txt": TL_TEXT.get(tl, "any date"), "topic": P.get("topic", ""),
+        "hashes": P.setdefault("hashes", []),
+    }
+
+
+def rule_score(t, rules):
+    """शीर्षक/टैग (छोटे अक्षरों में) देखकर: -1 = सीधे नकारो, वरना बोनस अंक।"""
+    if not rules:
+        return 0
+    t = (t or "").lower().replace("’", "'")
+    if rules["ex_re"] and rules["ex_re"].search(t):
+        return -1
+    if not gender_ok(t, rules["gender"]):
+        return -1
+    yf = rules.get("year_from")
+    if yf:
+        ys = years_in(t)
+        if ys and max(ys) < yf:
+            return -1  # पुरानी फोटो
+    must_hit = any(m in t for m in rules["must"]) if rules["must"] else True
+    if rules["must"] and not must_hit and not rules["vision"]:
+        return -1  # विषय का कोई ज़रूरी शब्द ही नहीं, और AI देखकर जाँचेगा भी नहीं
+    bonus = 1 if (must_hit and rules["must"]) else 0
+    if rules["gender"] == "women" and GENDER_W.search(t):
+        bonus += 1
+    return bonus
+
+
+# ---------------------------------------------------------------- तस्वीर के स्रोत
+# हर स्रोत (url, शीर्षक/टैग) की सूची देता है, ताकि मेल जाँचा जा सके।
+def _note(err, msg):
+    if err is not None:
+        err.append(msg)
+
+
+def pixabay_urls(query, key, err=None, latest=False):
+    lang = "hi" if re.search(r"[\u0900-\u097F]", query) else "en"
+    try:
+        r = requests.get(
+            "https://pixabay.com/api/",
+            params={
+                "key": key, "q": query[:100], "lang": lang,
+                "image_type": "photo", "per_page": 30, "safesearch": "true",
+                "order": "latest" if latest else "popular",
+            },
+            headers=HEADERS, timeout=25,
+        )
+        r.raise_for_status()
+        out = []
+        for h in r.json().get("hits", []):
+            url = h.get("largeImageURL") or h.get("webformatURL")
+            out.append((url, h.get("tags", "")))
+        return out
+    except Exception as e:
+        _note(err, f"Pixabay: {str(e)[:90]}")
+        return []
+
+
+def web_urls(query, err=None, timelimit=None):
+    """इंटरनेट की तस्वीरें; timelimit: d=24 घंटे, w=हफ़्ता, m=महीना, y=साल।"""
+    if DDGS is None:
+        _note(err, "इंटरनेट खोज की लाइब्रेरी (ddgs) इंस्टॉल नहीं है")
+        return []
+    try:
+        with DDGS() as d:
+            try:
+                results = list(d.images(query, max_results=25, timelimit=timelimit or None))
+            except TypeError:
+                results = list(d.images(query, max_results=25))
+        return [(r.get("image"), f"{r.get('title', '')} {(r.get('url') or '').split('?')[0]}")
+                for r in results]
+    except Exception as e:
+        _note(err, f"इंटरनेट खोज: {type(e).__name__}: {str(e)[:90]}")
+        return []
+
+
+def ddg_news_urls(query, err=None, timelimit=None):
+    """ताज़ा समाचारों की मुख्य तस्वीरें (शीर्षक+विवरण के साथ, इसलिए मेल जाँचना आसान)।"""
+    if DDGS is None:
+        _note(err, "इंटरनेट खोज की लाइब्रेरी (ddgs) इंस्टॉल नहीं है")
+        return []
+    try:
+        with DDGS() as d:
+            try:
+                res = list(d.news(query, max_results=15, timelimit=timelimit or None))
+            except TypeError:
+                res = list(d.news(query, max_results=15))
+        out = []
+        for r in res:
+            img = r.get("image")
+            if img:
+                out.append((img, f"{r.get('title', '')} {r.get('body', '')}"))
+        return out
+    except Exception as e:
+        _note(err, f"समाचार-फोटो: {type(e).__name__}: {str(e)[:90]}")
+        return []
+
+
+BING_INTERVAL = {"d": "7", "w": "8", "m": "9"}
+
+
+def bing_news_urls(query, err=None, timelimit=None):
+    """Bing News की RSS से ताज़ा समाचारों की तस्वीरें (बिना key, बिना लाइब्रेरी)।"""
+    import xml.etree.ElementTree as ET
+    params = {"q": query, "format": "rss", "setmkt": "en-IN", "count": 20}
+    if timelimit in BING_INTERVAL:
+        params["qft"] = f'interval="{BING_INTERVAL[timelimit]}"'
+    try:
+        r = requests.get(
+            "https://www.bing.com/news/search",
+            params=params, headers=HEADERS, timeout=25,
+        )
+        r.raise_for_status()
+        root = ET.fromstring(r.content)
+        out = []
+        for item in root.iter("item"):
+            title = item.findtext("title") or ""
+            desc = item.findtext("description") or ""
+            img = None
+            for el in item.iter():
+                if el.tag.endswith("Image") and (el.text or "").strip():
+                    img = el.text.strip()
+                    break
+            if not img:
+                continue
+            img = img.replace("http://", "https://")
+            if "bing.com/th" in img and "w=" not in img:
+                img += "&w=1280&h=800&c=7&rs=1"
+            out.append((img, f"{title} {desc}"))
+        return out
+    except Exception as e:
+        _note(err, f"Bing समाचार: {type(e).__name__}: {str(e)[:90]}")
+        return []
+
+
+def openverse_urls(query, err=None):
+    try:
+        r = requests.get(
+            "https://api.openverse.org/v1/images/",
+            params={"q": query, "page_size": 20, "mature": "false"},
+            headers=HEADERS, timeout=25,
+        )
+        r.raise_for_status()
+        out = []
+        for item in r.json().get("results", []):
+            tags = " ".join(t.get("name", "") for t in item.get("tags", []) or [])
+            text = f"{item.get('title', '')} {tags}"
+            out.append((item.get("url"), text))
+            out.append((item.get("thumbnail"), text))
+        return out
+    except Exception as e:
+        _note(err, f"Openverse: {str(e)[:90]}")
+        return []
+
+
+def wikimedia_urls(query, err=None, recent_years=None):
+    """ऐतिहासिक विषयों (जगह, राजा, इमारत) के लिए बहुत अच्छा स्रोत।"""
+    params = {
+        "action": "query", "format": "json", "generator": "search",
+        "gsrsearch": query, "gsrnamespace": 6, "gsrlimit": 20,
+        "prop": "imageinfo", "iiprop": "url|mime|extmetadata",
+        "iiurlwidth": 1600,
+    }
+    if recent_years:
+        params["gsrsort"] = "create_timestamp_desc"
+    min_year = time.localtime().tm_year - int(recent_years or 0)
+    for attempt in range(2):
+        try:
+            r = requests.get(
+                "https://commons.wikimedia.org/w/api.php",
+                params=params, headers=HEADERS, timeout=25,
+            )
+            if r.status_code == 429:
+                time.sleep(2 + attempt * 2)
+                continue
+            r.raise_for_status()
+            pages = r.json().get("query", {}).get("pages", {})
+            out = []
+            for page in pages.values():
+                info = (page.get("imageinfo") or [{}])[0]
+                if info.get("mime") not in ("image/jpeg", "image/png"):
+                    continue
+                url = info.get("thumburl") or info.get("url")
+                meta = info.get("extmetadata") or {}
+                if recent_years:
+                    stamp = (
+                        (meta.get("DateTimeOriginal") or meta.get("DateTime") or {})
+                        .get("value", "")
+                    )
+                    ym = re.search(r"(?:19|20)\d\d", stamp)
+                    if not ym or int(ym.group(0)) < min_year:
+                        continue  # तारीख़ पता नहीं या पुरानी: नहीं लेंगे
+                desc = re.sub(
+                    r"<[^>]+>", " ",
+                    (meta.get("ImageDescription") or {}).get("value", ""),
+                )
+                out.append((url, f"{page.get('title', '')} {desc}"))
+            return out
+        except Exception as e:
+            _note(err, f"Wikimedia: {str(e)[:90]}")
+    return []
+
+
+OLD_YEAR = re.compile(r"\b(18\d\d|19\d\d|200\d|201[0-2])\b")
+
+
+def to_rgb(img):
+    """पारदर्शी हिस्से काले नहीं, सफ़ेद पृष्ठभूमि पर रखता है।"""
+    img = ImageOps.exif_transpose(img)
+    if img.mode in ("RGBA", "LA") or (img.mode == "P" and "transparency" in img.info):
+        rgba = img.convert("RGBA")
+        bg = Image.new("RGB", rgba.size, (255, 255, 255))
+        bg.paste(rgba, mask=rgba.split()[-1])
+        return bg
+    return img.convert("RGB")
+
+
+def is_blank(img):
+    """लगभग एक ही रंग की (काली/सफ़ेद/सादी) तस्वीर पहचानता है।"""
+    stat = ImageStat.Stat(img.convert("L").resize((64, 64)))
+    return stat.stddev[0] < 9 or stat.mean[0] < 12 or stat.mean[0] > 248
+
+
+def try_download(cands, save_path, used, words, max_tries=8,
+                 exclude=(), modern=False, need=None, stats=None):
+    if need is None:
+        need = 2 if len(words) >= 3 else 1
+    ex = [e.lower() for e in exclude if e]
+    scored = []
+    for url, text in cands:
+        if not url or url in used:
+            continue
+        t = (text or "").lower()
+        if any(e in t for e in ex):
+            continue
+        if modern and OLD_YEAR.search(t):
+            continue
+        sc = score_text(text, words) if words else 0
+        if words and sc < need:
+            continue  # शीर्षक/टैग में पर्याप्त मेल नहीं
+        scored.append((sc, url))
+
+    scored.sort(key=lambda x: -x[0])
+    if stats is not None:
+        stats["pass"] = len(scored)
+
+    tries = 0
+    for _, url in scored:
+        if tries >= max_tries:
+            break
+        tries += 1
+        try:
+            r = requests.get(url, headers=HEADERS, timeout=25)
+            r.raise_for_status()
+            if len(r.content) > 15_000_000:
+                continue
+            with Image.open(io.BytesIO(r.content)) as img:
+                rgb = to_rgb(img)
+            if rgb.width < 500 or rgb.height < 350 or is_blank(rgb):
+                continue
+            rgb.thumbnail((2000, 2000))
+            rgb.save(save_path, "JPEG", quality=90)
+            used.add(url)
+            return True
+        except Exception:
+            continue
+    return False
+
+
+def widen(tl):
+    """ताज़ा तस्वीर न मिले तो समय-सीमा धीरे-धीरे बढ़ाएँ।"""
+    order = ["d", "w", "m", "y"]
+    if tl in order:
+        return order[order.index(tl):]
+    return [tl or ""]
+
+
+WIKI_YEARS = {"d": 1, "w": 1, "m": 1, "y": 2}
+
+
+def make_sources(query, px_key, web_on, tl):
+    """tl खाली = ऐतिहासिक विषय; वरना ताज़ा तस्वीरों वाले स्रोत।"""
+    srcs = []
+    if tl:
+        srcs.append(("Bing समाचार", lambda e: bing_news_urls(query, e, tl)))
+        if web_on:
+            srcs.append(("समाचार-फोटो", lambda e: ddg_news_urls(query, e, tl)))
+            srcs.append(("इंटरनेट (ताज़ा)", lambda e: web_urls(query, e, tl)))
+        srcs.append(("Wikimedia (नई)", lambda e: wikimedia_urls(query, e, WIKI_YEARS.get(tl, 2))))
+        if px_key and tl not in ("d", "w"):
+            srcs.append(("Pixabay (नई)", lambda e: pixabay_urls(query, px_key, e, latest=True)))
+    else:
+        if px_key:
+            srcs.append(("Pixabay", lambda e: pixabay_urls(query, px_key, e)))
+        srcs.append(("Wikimedia", lambda e: wikimedia_urls(query, e)))
+        if web_on:
+            srcs.append(("इंटरनेट", lambda e: web_urls(query, e)))
+        srcs.append(("Openverse", lambda e: openverse_urls(query, e)))
+    return srcs
+
+
+def find_photo(queries, save_path, used, key, web_on, anchor,
+               exclude=(), modern=False, relaxed=False, log=None, timelimit=None):
+    tl = timelimit if timelimit is not None else ("y" if modern else "")
+    for q in queries:
+        words = match_words("" if relaxed else q, anchor)
+        for name, fetch in make_sources(q, key, web_on, tl):
+            errs, stats = [], {}
+            cands = fetch(errs)
+            got = try_download(
+                cands, save_path, used, words,
+                exclude=exclude, modern=modern or bool(tl),
+                need=1 if relaxed else None, stats=stats,
+            )
+            if log is not None:
+                line = (
+                    f"'{q}' → {name}: {len(cands)} मिलीं, "
+                    f"{stats.get('pass', 0)} मेल खाईं"
+                    + (" ✅ ली गई" if got else "")
+                )
+                if errs:
+                    line += f" | समस्या: {errs[0]}"
+                log.append(line)
+            if got:
+                return name, q
+    return None, None
+
+
+def guess_modern(*texts):
+    blob = " ".join(texts).lower()
+    if re.search(r"\b(20[1-3]\d)\b", blob):
+        return True
+    return bool(re.search(
+        r"cricket|क्रिकेट|odi\b|t20|ipl|world cup|match|मैच|tournament|league|"
+        r"election|चुनाव|smartphone|startup",
+        blob,
+    ))
+
+
+_AI_GATE = {"t": 0.0}
+AI_GAP = 16  # सेकंड: Pollinations की अनाम सेवा 15 सेकंड में एक अनुरोध ही लेती है
+
+
+def ai_image(prompt, save_path, size, err=None):
+    """Pollinations से तस्वीर बनवाता है (बिना key)। खाली/ख़राब तस्वीर नकारता है।"""
+    if len(prompt.strip()) < 15:
+        return False
+
+    w, h = size
+    scale = 1024 / max(w, h)
+    w = max(256, int(w * scale) // 8 * 8)
+    h = max(256, int(h * scale) // 8 * 8)
+    full = (
+        f"{prompt}, realistic photograph, natural lighting, "
+        "high detail, no text, no watermark"
+    )
+
+    started = time.time()
+    for model in ("flux", "flux", None):
+        if time.time() - started > 300:
+            return False
+
+        wait = AI_GAP - (time.time() - _AI_GATE["t"])
+        if wait > 0:
+            time.sleep(wait)
+        _AI_GATE["t"] = time.time()
+
+        try:
+            params = {
+                "width": w, "height": h, "nologo": "true",
+                "seed": random.randint(1, 1000000),
+            }
+            if model:
+                params["model"] = model
+            r = requests.get(
+                "https://image.pollinations.ai/prompt/" + quote(full[:600]),
+                params=params, headers=HEADERS, timeout=90,
+            )
+            _AI_GATE["t"] = time.time()
+            if (
+                r.status_code == 200
+                and r.headers.get("content-type", "").startswith("image")
+            ):
+                with Image.open(io.BytesIO(r.content)) as img:
+                    rgb = to_rgb(img)
+                if rgb.width >= 256 and not is_blank(rgb):
+                    rgb.save(save_path, "JPEG", quality=92)
+                    return True
+                _note(err, "AI ने खाली/बेकार तस्वीर दी")
+            elif r.status_code == 429:
+                _note(err, "AI सेवा अभी व्यस्त है (429)")
+            else:
+                _note(err, f"AI सेवा ने {r.status_code} दिया")
+        except Exception as e:
+            _note(err, f"AI: {type(e).__name__}: {str(e)[:70]}")
+    return False
+
+
+def card_idx_for(path):
+    """फ़ाइल के नाम से टेक्स्ट कार्ड का रंग-क्रम तय (पृष्ठभूमि और शब्दों का रंग मेल खाए)।"""
+    return int(hashlib.md5(str(path).encode()).hexdigest()[:4], 16) % len(CARD_BG)
+
+
+def make_text_card(path, size, idx=None):
+    """तस्वीर न मिलने पर आधुनिक रंगीन पृष्ठभूमि। शब्द वीडियो बनाते समय ऊपर लिखे जाते हैं।"""
+    idx = card_idx_for(path) if idx is None else idx
+    w, h = size
+    c1, c2, c3 = CARD_BG[idx % len(CARD_BG)]
+    base = ImageOps.colorize(Image.linear_gradient("L").resize((w, h)), c1, c2)
+    glow = Image.new("RGB", (w, h), (0, 0, 0))
+    d = ImageDraw.Draw(glow)
+    d.ellipse([w * 0.45, -h * 0.12, w * 1.35, h * 0.45], fill=c3)
+    d.ellipse([-w * 0.4, h * 0.6, w * 0.6, h * 1.2], fill=c3)
+    glow = glow.filter(ImageFilter.GaussianBlur(max(20, min(w, h) // 5)))
+    out = ImageChops.screen(base, glow)
+    bar = CARD_ACCENT[idx % len(CARD_ACCENT)][0]
+    ImageDraw.Draw(out).rectangle(
+        [int(w * 0.07), int(h * 0.16), int(w * 0.07) + int(w * 0.16),
+         int(h * 0.16) + max(6, h // 140)],
+        fill=bar,
+    )
+    out.save(path, "JPEG", quality=92)
+
+
+def make_fallback_image(path, size, pool=None, avoid=None, title=""):
+    """तस्वीर न मिले तो आधुनिक टेक्स्ट-कार्ड की पृष्ठभूमि (पुरानी तस्वीर दोहराना या सादा रंग नहीं)।
+    शब्द वीडियो बनाते समय दृश्य के 'headline' से ऊपर लिखे जाते हैं।"""
+    make_text_card(path, size)
+    return "टेक्स्ट कार्ड"
+
+
+def diagnose_services(pixabay_key="", gemini_key=""):
+    """हर बाहरी सेवा को एक छोटे परीक्षण से जाँचता है: [(नाम, ठीक?, विवरण)]"""
+    rows = []
+
+    en = translate_hi_en("नमस्ते दोस्तो")
+    if GoogleTranslator is None:
+        rows.append(("Google अनुवाद", False, "deep-translator इंस्टॉल नहीं है"))
+    else:
+        rows.append(("Google अनुवाद", bool(en.strip()), en[:40] or "जवाब नहीं आया"))
+
+    for name, fn in (
+        ("इंटरनेट खोज", web_urls),
+        ("Wikimedia", wikimedia_urls),
+        ("Openverse", openverse_urls),
+    ):
+        errs = []
+        res = fn("Babylon Ishtar Gate", errs)
+        rows.append((name, len(res) > 0,
+                     f"{len(res)} मिलीं" + (f" | {errs[0]}" if errs else "")))
+
+    for name, fn in (
+        ("ताज़ा समाचार-फोटो (Bing)", lambda q, e: bing_news_urls(q, e, "w")),
+        ("ताज़ा समाचार-फोटो (DDG)", lambda q, e: ddg_news_urls(q, e, "w")),
+        ("ताज़ा इंटरनेट-फोटो (DDG)", lambda q, e: web_urls(q, e, "w")),
+    ):
+        errs = []
+        res = fn("India cricket match", errs)
+        rows.append((name, len(res) > 0,
+                     f"{len(res)} मिलीं" + (f" | {errs[0]}" if errs else "")))
+
+    if gemini_key:
+        models, lerr = gemini_models(gemini_key)
+        try:
+            buf = io.BytesIO()
+            Image.new("RGB", (96, 96), (220, 30, 30)).save(buf, "JPEG")
+            parts = [
+                {"text": 'What is the dominant colour of this image? Reply ONLY JSON {"colour": "..."}'},
+                {"inline_data": {"mime_type": "image/jpeg",
+                                 "data": base64.b64encode(buf.getvalue()).decode()}},
+            ]
+            txt, gerr = gemini_generate_parts(gemini_key, parts, models or GEMINI_MODELS)
+            rows.append(("Gemini फोटो-जाँच", bool(txt), (txt[:50] if txt else gerr[:120]) or lerr))
+        except Exception as e:
+            rows.append(("Gemini फोटो-जाँच", False, str(e)[:100]))
+
+    if pixabay_key:
+        errs = []
+        res = pixabay_urls("Babylon", pixabay_key, errs)
+        rows.append(("Pixabay", len(res) > 0,
+                     f"{len(res)} मिलीं" + (f" | {errs[0]}" if errs else "")))
+
+    try:
+        r = requests.get(
+            "https://text.pollinations.ai/" + quote("Say hello in one word"),
+            headers=HEADERS, timeout=30,
+        )
+        rows.append(("AI लेखन (Pollinations)",
+                     r.status_code == 200 and bool(r.text.strip()),
+                     f"जवाब कोड {r.status_code}"))
+    except Exception as e:
+        rows.append(("AI लेखन (Pollinations)", False, str(e)[:80]))
+
+    errs = []
+    tmp = os.path.join(tempfile.gettempdir(), "ravi_diag.jpg")
+    t0 = time.time()
+    ok = ai_image(
+        "A beautiful ancient city wall at sunrise, wide photograph", tmp, (512, 512), errs
+    )
+    rows.append(("AI तस्वीर (Pollinations)", ok,
+                 f"{time.time() - t0:.0f} सेकंड" + (f" | {errs[-1]}" if errs else "")))
+    return rows
+
+
+def collect_photos(query, folder, tag, key, web_on, modern, n=6,
+                   timelimit=None, exclude=(), used=None, rules=None):
+    """कई विकल्प लौटाता है [(फ़ाइल, स्रोत, url)] और लॉग। rules हों तो पुरुष/महिला, साल,
+    ग़लत शब्द और पहले लग चुकी फोटो से मिलती-जुलती फोटो अपने-आप हट जाती हैं।"""
+    tl = timelimit if timelimit is not None else ("y" if modern else "")
+    words = match_words(query, "")
+    ex = [e.lower() for e in exclude if e]
+    used = used if used is not None else set()
+
+    found, seen, log, local_h = [], set(), [], []
+    for name, fetch in make_sources(query, key, web_on, tl):
+        if len(found) >= n:
+            break
+        errs = []
+        cands = fetch(errs)
+        scored = []
+        for url, text in cands:
+            if not url or url in seen or url in used:
+                continue
+            t = (text or "").lower()
+            if any(e in t for e in ex):
+                continue
+            if (modern or tl) and OLD_YEAR.search(t):
+                continue
+            bonus = rule_score(t, rules)
+            if bonus < 0:
+                continue
+            sc = score_text(text, words) if words else 1
+            if sc >= 1:
+                scored.append((sc + bonus, url))
+        scored.sort(key=lambda x: -x[0])
+        log.append(
+            f"{name}: {len(cands)} मिलीं, {len(scored)} नियमों पर खरी"
+            + (f" | समस्या: {errs[0]}" if errs else "")
+        )
+
+        tries = 0
+        for _, url in scored:
+            if len(found) >= n or tries >= 10:
+                break
+            tries += 1
+            seen.add(url)
+            try:
+                r = requests.get(url, headers=HEADERS, timeout=25)
+                r.raise_for_status()
+                if len(r.content) > 15_000_000:
+                    continue
+                with Image.open(io.BytesIO(r.content)) as img:
+                    rgb = to_rgb(img)
+                if rgb.width < 400 or rgb.height < 300 or is_blank(rgb):
+                    continue
+                h = ahash(rgb)
+                if rules and is_dup(h, rules["hashes"]):
+                    continue  # यही या इससे मिलती फोटो किसी दृश्य में पहले लग चुकी है
+                if is_dup(h, local_h):
+                    continue
+                local_h.append(h)
+                rgb.thumbnail((2000, 2000))
+                path = os.path.join(folder, f"cand_{tag}_{len(found)}.jpg")
+                rgb.save(path, "JPEG", quality=88)
+                found.append((path, name, url))
+            except Exception:
+                continue
+    return found, log
+
+
+# ---------------------------------------------------------------- Gemini से तस्वीर की जाँच
+_GEM_LOCK = threading.Lock()
+_GEM_GATE = {"t": 0.0}
+
+
+def gemini_generate_parts(key, parts, models):
+    errors = []
+    url = "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent"
+    for model in models:
+        for use_json in (True, False):
+            try:
+                body = {"contents": [{"parts": parts}]}
+                if use_json:
+                    body["generationConfig"] = {"responseMimeType": "application/json"}
+                r = requests.post(
+                    url.format(model),
+                    headers={"x-goog-api-key": key, "Content-Type": "application/json"},
+                    json=body, timeout=90,
+                )
+                if r.status_code == 200:
+                    cands = r.json().get("candidates") or []
+                    if cands:
+                        ps = cands[0].get("content", {}).get("parts", [])
+                        text = "".join(p.get("text", "") for p in ps)
+                        if text.strip():
+                            return text, ""
+                    errors.append(f"{model}: खाली जवाब")
+                    break
+                errors.append(f"{model} {r.status_code}: {r.text[:140]}")
+                if r.status_code == 429:
+                    time.sleep(6)
+                if r.status_code == 400 and use_json and "mime" in r.text.lower():
+                    continue
+                if r.status_code in (400, 401, 403) and "key" in r.text.lower():
+                    return "", " | ".join(errors)[:400]
+                break
+            except Exception as e:
+                errors.append(f"{model}: {str(e)[:90]}")
+                break
+    return "", " | ".join(errors)[:400]
+
+
+def gemini_vision_pick(key, models, topic, scene_en, query, paths, fresh_hint, rules=None):
+    """Gemini तस्वीरें देखकर सबसे सही चुनता है।
+    लौटाता है (नंबर 1..N, कारण); 0 = कोई ठीक नहीं; None = जाँच नहीं हो सकी।"""
+    extra = f"Today's date is {TODAY.isoformat()}. "
+    if rules:
+        g = {"men": "men's (male players/people only)",
+             "women": "women's (female players/people only)"}.get(rules.get("gender"))
+        if g:
+            extra += f"People/teams in the photo must be {g}; a photo of the other gender is WRONG. "
+        if rules.get("ex"):
+            extra += "Never choose photos showing: " + ", ".join(rules["ex"][:12]) + ". "
+        if rules.get("rec_txt") and rules["rec_txt"] != "any date":
+            extra += f"The photo must be {rules['rec_txt']}. "
+    prompt = (
+        "You are a strict photo editor for a Hindi video.\n"
+        f"Video topic: {topic[:200]}\n"
+        f"Scene narration (meaning in English): {scene_en[:400]}\n"
+        f"Search query used: {query}\n"
+        + extra +
+        f"\nThere are {len(paths)} candidate photos, numbered 1 to {len(paths)}.\n"
+        "Choose the ONE photo that best illustrates this scene. Rules: it must clearly "
+        "show the subject/event described, or a very closely related real scene. "
+        "REJECT a photo that shows a different sport, subject or person than the story "
+        "(for example a wrestler or film star in a cricket story). "
+        + ("The video is about a recent event, so the photo must look modern and recent "
+           "(modern kits, cameras, stadiums, clothing); reject old or black-and-white photos, "
+           "and photos of a different sport format, team or era. "
+           if fresh_hint else "")
+        + "Reject photos that are unrelated, mostly text, logos, screenshots, collages, "
+        "watermarked or very low quality. If none is acceptable return 0.\n"
+        'Reply ONLY JSON: {"best": <number 0..N>, "reason": "<max 12 words>"}'
+    )
+    parts = [{"text": prompt}]
+    for i, p in enumerate(paths, 1):
+        try:
+            with Image.open(p) as im:
+                im = to_rgb(im)
+                im.thumbnail((512, 512))
+                buf = io.BytesIO()
+                im.save(buf, "JPEG", quality=72)
+            parts.append({"text": f"Photo {i}:"})
+            parts.append({"inline_data": {
+                "mime_type": "image/jpeg",
+                "data": base64.b64encode(buf.getvalue()).decode(),
+            }})
+        except Exception:
+            return None, "तस्वीर पढ़ी नहीं जा सकी"
+
+    with _GEM_LOCK:
+        wait = 4.0 - (time.time() - _GEM_GATE["t"])
+        if wait > 0:
+            time.sleep(wait)
+        text, err = gemini_generate_parts(key, parts, models)
+        _GEM_GATE["t"] = time.time()
+
+    data = parse_json(text) if text else None
+    if not data:
+        return None, err or "जवाब समझ नहीं आया"
+    try:
+        best = int(data.get("best", 0))
+    except Exception:
+        return None, "जवाब में नंबर नहीं था"
+    reason = str(data.get("reason", ""))[:80]
+    if 1 <= best <= len(paths):
+        return best, reason
+    return 0, reason
+
+
+def smart_photo(queries, save_path, folder, tag, px_key, web_on, anchor,
+                modern, tl, gem, scene_en, topic, exclude, log, used, n=5, rules=None):
+    """कई विकल्प जुटाकर (और Gemini हो तो उसे दिखाकर) सबसे सही तस्वीर चुनता है।
+    नियम (rules) के हिसाब से ग़लत/पुरानी/दोहराई तस्वीर कभी नहीं चुनी जाती।"""
+    attempts = 0
+    for q in queries[:2]:
+        for lim in widen(tl):
+            if attempts >= 4:
+                return None, None
+            attempts += 1
+            found, clog = collect_photos(
+                q, folder, f"{tag}_{attempts}", px_key, web_on, modern or bool(lim),
+                n=n, timelimit=lim, exclude=exclude, used=used, rules=rules,
+            )
+            log.extend(f"'{q}' [{lim or 'कोई भी समय'}] {l}" for l in clog)
+            if not found:
+                continue
+
+            pick = 1
+            if gem:
+                pick, reason = gemini_vision_pick(
+                    gem["key"], gem["models"], topic, scene_en, q,
+                    [f_[0] for f_ in found], bool(lim) or modern, rules,
+                )
+                if pick is None:
+                    log.append(f"⚠️ AI जाँच नहीं हो सकी ({reason}); पहली नियमों पर खरी तस्वीर ली")
+                    pick = 1
+                elif pick == 0:
+                    log.append(f"🧐 AI जाँच ने सब तस्वीरें नकारीं: {reason}")
+                    for f_ in found:
+                        try:
+                            os.remove(f_[0])
+                        except Exception:
+                            pass
+                    continue
+                else:
+                    log.append(f"🧐 AI जाँच ने तस्वीर {pick} चुनी: {reason}")
+
+            path_, src_, url_ = found[pick - 1]
+            try:
+                h = ahash_file(path_)
+            except Exception:
+                h = None
+            dup = False
+            if rules is not None and h is not None:
+                with _HASH_LOCK:  # साथ-साथ चलती खोजें एक ही फोटो दो दृश्यों में न लगा दें
+                    if is_dup(h, rules["hashes"]):
+                        dup = True
+                    else:
+                        rules["hashes"].append(h)
+            if dup:
+                log.append("♻️ यह फोटो किसी और दृश्य में पहले लग चुकी है, छोड़ दी")
+                for f_ in found:
+                    try:
+                        os.remove(f_[0])
+                    except Exception:
+                        pass
+                continue
+
+            shutil.copy(path_, save_path)
+            used.add(url_)
+            for f_ in found:
+                try:
+                    os.remove(f_[0])
+                except Exception:
+                    pass
+            return src_ + (" ✔ AI जाँच" if gem and pick else ""), q
+    return None, None
+
+
+def ai_verified(prompt, path, size, err, gem, rules, topic, scene_en):
+    """सही विषय की AI तस्वीर: बनवाकर Gemini से जँचवाता है; ग़लत/दोहराई हो तो दोबारा बनवाता है।"""
+    for _ in range(2):
+        if not prompt or not ai_image(prompt, path, size, err):
+            return False
+        try:
+            h = ahash_file(path)
+        except Exception:
+            continue
+        if rules is not None and is_dup(h, rules["hashes"]):
+            _note(err, "AI तस्वीर पहले जैसी निकली")
+            continue
+        if gem:
+            pick, why = gemini_vision_pick(
+                gem["key"], gem["models"], topic, scene_en, prompt[:80], [path], True, rules)
+            if pick == 0:
+                _note(err, "AI तस्वीर विषय से मेल नहीं खाई: " + why)
+                continue
+        if rules is not None:
+            with _HASH_LOCK:
+                rules["hashes"].append(h)
+        return True
+    return False
+
+
+# ---------------------------------------------------------------- आवाज़
+def voice_params(text, speed_pct, natural):
+    """हर दृश्य के लिए थोड़ा अलग गति और सुर, ताकि आवाज़ मशीनी न लगे।"""
+    rate = int(speed_pct)
+    pitch = 0
+    if natural:
+        rate += random.randint(-4, 3)
+        pitch += random.randint(-3, 3)
+        t = text.strip()
+        if t.endswith("?"):
+            pitch += 3
+            rate += 2
+        elif t.endswith("!"):
+            pitch += 2
+            rate += 3
+    return f"{rate:+d}%", f"{pitch:+d}Hz"
+
+
+async def synth(text, voice, path, rate, pitch):
+    bounds = []
+    try:
+        comm = edge_tts.Communicate(
+            text=text, voice=voice, rate=rate, pitch=pitch,
+            boundary="WordBoundary",
+        )
+    except TypeError:
+        comm = edge_tts.Communicate(
+            text=text, voice=voice, rate=rate, pitch=pitch
+        )
+
+    with open(path, "wb") as f:
+        async for chunk in comm.stream():
+            kind = chunk.get("type")
+            if kind == "audio":
+                f.write(chunk["data"])
+            elif kind in ("WordBoundary", "SentenceBoundary"):
+                bounds.append((
+                    chunk["offset"] / 1e7,
+                    chunk["duration"] / 1e7,
+                    chunk.get("text", ""),
+                ))
+    return bounds
+
+
+async def make_voices(scenes, voice, folder, speed, natural, on_progress):
+    """एक साथ 3 दृश्यों की आवाज़ बनाता है (तेज़)।"""
+    sem = asyncio.Semaphore(3)
+    results = [None] * len(scenes)
+    counter = {"n": 0}
+
+    async def one(i, text):
+        async with sem:
+            path = os.path.join(folder, f"voice_{i}.mp3")
+            rate, pitch = voice_params(text, speed, natural)
+            bounds = []
+            for attempt in range(3):
+                try:
+                    bounds = await synth(text, voice, path, rate, pitch)
+                    break
+                except Exception:
+                    if attempt == 2:
+                        raise
+                    await asyncio.sleep(2)
+            results[i] = (path, bounds)
+            counter["n"] += 1
+            on_progress(counter["n"] - 1)
+
+    await asyncio.gather(*[one(i, t) for i, t in enumerate(scenes)])
+    return results
+
+
+def audio_duration(path, ffmpeg):
+    result = subprocess.run(
+        [ffmpeg, "-i", path, "-f", "null", "-"],
+        capture_output=True,
+        text=True,
+    )
+    match = re.search(
+        r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", result.stderr
+    )
+    if not match:
+        raise RuntimeError("आवाज़ की अवधि नहीं मिल सकी।")
+    h, m, s = match.groups()
+    return int(h) * 3600 + int(m) * 60 + float(s)
+
+
+# ---------------------------------------------------------------- कैप्शन
+def build_cues(text, bounds, voice_len, max_chars=26, max_words=5):
+    """बोले जा रहे शब्दों के हिसाब से छोटे-छोटे कैप्शन (शुरू, अंत, टेक्स्ट)।"""
+    units = []
+    for off, dur, t in bounds or []:
+        t = (t or "").strip()
+        if t:
+            units.append((off, off + max(dur, 0.05), t))
+    if not units:
+        units = [(0.0, voice_len, text.strip())]
+
+    words = []
+    for s, e, t in units:
+        ws = t.split()
+        if not ws:
+            continue
+        total = sum(len(w) + 1 for w in ws)
+        cur = s
+        for w in ws:
+            d = (e - s) * (len(w) + 1) / total
+            words.append((cur, cur + d, w))
+            cur += d
+
+    cues, cur = [], []
+    for w in words:
+        cand = " ".join(x[2] for x in cur + [w])
+        if cur and (len(cand) > max_chars or len(cur) >= max_words):
+            cues.append([cur[0][0], cur[-1][1], " ".join(x[2] for x in cur)])
+            cur = [w]
+        else:
+            cur.append(w)
+    if cur:
+        cues.append([cur[0][0], cur[-1][1], " ".join(x[2] for x in cur)])
+
+    if len(cues) >= 2 and len(cues[-1][2].split()) == 1:
+        if len(cues[-2][2]) + len(cues[-1][2]) <= max_chars + 12:
+            cues[-2][1] = cues[-1][1]
+            cues[-2][2] += " " + cues[-1][2]
+            cues.pop()
+
+    for i in range(len(cues) - 1):
+        cues[i][1] = cues[i + 1][0]
+    if cues:
+        cues[-1][1] = max(cues[-1][1], voice_len) + 0.15
+    return [tuple(c) for c in cues]
+
+
+def get_caption_font():
+    for p in FONT_PATHS:
+        if os.path.exists(p):
+            return p
+
+    d = os.path.join(tempfile.gettempdir(), "ravi_fonts")
+    os.makedirs(d, exist_ok=True)
+    for url in FONT_URLS:
+        p = os.path.join(d, os.path.basename(url))
+        if os.path.exists(p) and os.path.getsize(p) > 10000:
+            return p
+        try:
+            r = requests.get(url, headers=HEADERS, timeout=40)
+            r.raise_for_status()
+            if len(r.content) > 10000:
+                with open(p, "wb") as f:
+                    f.write(r.content)
+                return p
+        except Exception:
+            continue
+    return None
+
+
+def font_info(path):
+    try:
+        family, style = ImageFont.truetype(path, 20).getname()
+        return family, ("bold" in style.lower())
+    except Exception:
+        return None, False
+
+
+def ass_time(t):
+    cs = int(round(max(0.0, t) * 100))
+    hh = cs // 360000
+    mm = (cs // 6000) % 60
+    ss = (cs // 100) % 60
+    return f"{hh}:{mm:02d}:{ss:02d}.{cs % 100:02d}"
+
+
+def card_markup(text, w, h, accent):
+    """टेक्स्ट कार्ड के शब्द: बड़े अक्षर, कई पंक्तियाँ, सबसे लंबा शब्द रंगीन।"""
+    words = (text or "").replace("\\", "").replace("{", "(").replace("}", ")").upper().split()
+    per = 10 if h > w else (13 if h == w else 18)
+    lines, cur = [], ""
+    for wd in words:
+        if cur and len(cur) + 1 + len(wd) > per:
+            lines.append(cur)
+            cur = wd
+        else:
+            cur = (cur + " " + wd).strip()
+    if cur:
+        lines.append(cur)
+    lines = lines[:4]
+    hl = max(words, key=len) if words else ""
+    done, out = False, []
+    for ln in lines:
+        parts = []
+        for wd in ln.split():
+            if not done and wd == hl:
+                parts.append("{\\c" + accent + "}" + wd + "{\\c&H00FFFFFF&}")
+                done = True
+            else:
+                parts.append(wd)
+        out.append(" ".join(parts))
+    return "\\N".join(out)
+
+
+def write_ass(path, cues, size, font_path, size_ratio, lead,
+              title=None, title_style="pop", title_pos="top", title_end=3.4,
+              card=None, card_idx=0, total=0.0):
+    w, h = size
+    family, is_bold = font_info(font_path)
+    if not family:
+        return False
+
+    fontsize = int(min(w, h) * size_ratio * (1.0 if w <= h else 0.95))
+    outline = max(2, fontsize // 14)
+    margin_v = int(h * (0.14 if h > w else 0.09))
+    margin_lr = int(w * 0.07)
+    cs = int(min(w, h) * (0.15 if h > w else 0.16))
+    cout = max(3, cs // 16)
+    bold = 0 if is_bold else -1
+
+    lines = [
+        "[Script Info]",
+        "ScriptType: v4.00+",
+        f"PlayResX: {w}",
+        f"PlayResY: {h}",
+        "WrapStyle: 0",
+        "ScaledBorderAndShadow: yes",
+        "",
+        "[V4+ Styles]",
+        "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, "
+        "OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, "
+        "ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, "
+        "Alignment, MarginL, MarginR, MarginV, Encoding",
+        f"Style: Default,{family},{fontsize},&H00FFFFFF,&H000000FF,"
+        f"&H00000000,&H80000000,{bold},0,0,0,100,100,0,0,1,"
+        f"{outline},2,2,{margin_lr},{margin_lr},{margin_v},1",
+        f"Style: Title,{family},{int(fontsize * 1.35)},&H0000E0FF,&H000000FF,"
+        f"&H00000000,&H80000000,{bold},0,0,0,100,100,0,0,1,"
+        f"{outline + 1},3,{8 if title_pos == 'top' else 5},{margin_lr},{margin_lr},"
+        f"{int(h * 0.10)},1",
+        f"Style: Card,{family},{cs},&H00FFFFFF,&H000000FF,"
+        f"&H00000000,&H96000000,{bold},0,0,0,100,100,2,0,1,"
+        f"{cout},4,5,{margin_lr},{margin_lr},0,1",
+        "",
+        "[Events]",
+        "Format: Layer, Start, End, Style, Name, MarginL, MarginR, "
+        "MarginV, Effect, Text",
+    ]
+
+    if card and card.strip():
+        accent = CARD_ACCENT[card_idx % len(CARD_ACCENT)][1]
+        body = card_markup(card, w, h, accent)
+        ms = int(max(1.0, total) * 1000)
+        anim = (r"{\fad(250,200)\fscx88\fscy88\t(0,400,\fscx100\fscy100)"
+                r"\t(400," + str(ms) + r",\fscx106\fscy106)}")
+        lines.append(
+            f"Dialogue: 0,{ass_time(0.0)},{ass_time(total + 0.5)},Card,,0,0,0,,{anim}{body}"
+        )
+
+    for start, end, text in cues:
+        clean = text.replace("\\", "").replace("{", "(").replace("}", ")")
+        pop = r"{\fad(100,60)\fscx88\fscy88\t(0,140,\fscx100\fscy100)}"
+        lines.append(
+            f"Dialogue: 0,{ass_time(start + lead)},{ass_time(end + lead)},"
+            f"Default,,0,0,0,,{pop}{clean}"
+        )
+
+    if title and title.strip():
+        clean_t = title.strip().replace("\\", "").replace("{", "(").replace("}", ")")
+        clean_t = clean_t.replace("\n", "\\N")
+        cx = w // 2
+        ty = int(h * 0.10) if title_pos == "top" else h // 2
+        if title_style == "slide":
+            tag = "{\\move(%d,%d,%d,%d,0,320)\\fad(0,150)}" % (cx, -int(h * 0.1), cx, ty)
+        elif title_style == "fade":
+            tag = "{\\fad(400,300)}"
+        else:
+            tag = "{\\fad(120,120)\\fscx60\\fscy60\\t(0,260,\\fscx100\\fscy100)}"
+        lines.append(
+            f"Dialogue: 1,{ass_time(lead + 0.15)},{ass_time(lead + title_end)},"
+            f"Title,,0,0,0,,{tag}{clean_t}"
+        )
+
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+    return True
+
+
+# ---------------------------------------------------------------- वीडियो क्लिप
+ZOOM = 1.22  # अधिकतम ज़ूम
+
+
+def _motion(effect, e, t):
+    """(z, x, y) व्यंजक। e = 0..1 की चिकनी प्रगति, t = फ़्रेम गिनती।"""
+    cx = "iw/2-(iw/zoom/2)"
+    cy = "ih/2-(ih/zoom/2)"
+    rx = "(iw-iw/zoom)"
+    ry = "(ih-ih/zoom)"
+    if effect == "Static":
+        return "1.0", "0", "0"
+    if effect == "Zoom Out":
+        return f"{ZOOM}-{ZOOM - 1}*{e}", cx, cy
+    if effect == "Pan Left to Right":
+        return f"{ZOOM}", f"{rx}*{e}", f"{ry}/2"
+    if effect == "Pan Right to Left":
+        return f"{ZOOM}", f"{rx}*(1-{e})", f"{ry}/2"
+    if effect == "Pan Up":
+        return f"{ZOOM}", f"{rx}/2", f"{ry}*(1-{e})"
+    if effect == "Pan Down":
+        return f"{ZOOM}", f"{rx}/2", f"{ry}*{e}"
+    if effect == "Drift Zoom":
+        return f"1+0.18*{e}", f"{rx}*(0.25+0.5*{e})", f"{ry}*(0.6-0.3*{e})"
+    if effect == "Handheld":
+        return (
+            "1.12",
+            f"{rx}/2+iw*0.006*sin({t}/7)",
+            f"{ry}/2+ih*0.006*cos({t}/9)",
+        )
+    return f"1+{ZOOM - 1}*{e}", cx, cy  # Zoom In
+
+
+def motion_filter(effect, frames, w, h):
+    # धीमी शुरुआत और धीमा अंत (ease in-out), ताकि हलचल सिनेमा जैसी लगे
+    p = f"(on/{frames})"
+    e = f"({p}*{p}*(3-2*{p}))"
+    z, x, y = _motion(effect, e, "on")
+    return (
+        f"zoompan=z='{z}':x='{x}':y='{y}':"
+        f"d={frames}:s={w}x{h}:fps={FPS}"
+    )
+
+
+def end_state_filter(effect, w, h):
+    """पिछले क्लिप की आख़िरी झलक (ताकि ट्रांज़िशन में झटका न लगे)।"""
+    z, x, y = _motion(effect, "1", "0")
+    return (
+        f"zoompan=z='{z}':x='{x}':y='{y}':d=1:s={w}x{h}:fps={FPS}"
+    )
+
+
+def compose(src, k, ww, hh):
+    """धुंधली पृष्ठभूमि + बीच में पूरी तस्वीर (CapCut/InShot जैसा)।"""
+    return (
+        f"[{src}]split[a{k}][b{k}];"
+        f"[a{k}]scale={ww // 4}:{hh // 4}:force_original_aspect_ratio=increase,"
+        f"crop={ww // 4}:{hh // 4},boxblur=6:2,scale={ww}:{hh}[bg{k}];"
+        f"[b{k}]scale={ww}:{hh}:force_original_aspect_ratio=decrease[fg{k}];"
+        f"[bg{k}][fg{k}]overlay=(W-w)/2:(H-h)/2[c{k}]"
+    )
+
+
+def make_clip(image, prev, prev_effect, audio, voice_len, cues, out, size,
+              effect, transition, ffmpeg, font, size_ratio, folder,
+              pad, is_last, title="", title_style="pop", title_pos="top", video=None,
+              card_text=None, card_idx=0):
+    w, h = size
+    total = LEAD + voice_len + pad
+    frames = max(1, math.ceil(total * FPS))
+    k = 1.5 if max(w, h) <= 1300 else 1.3
+    bw, bh = int(w * k) // 2 * 2, int(h * k) // 2 * 2
+
+    if video:
+        # अपना वीडियो-क्लिप: ज़रूरत हो तो दोहराकर दृश्य की लंबाई तक चलाएँ
+        cmd = [ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
+               "-stream_loop", "-1", "-i", video]
+        graph = [
+            compose("0:v", "0", w, h),
+            f"[c0]fps={FPS},setsar=1,format=yuv420p[cur]",
+        ]
+    else:
+        cmd = [ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-i", image]
+        graph = [
+            compose("0:v", "0", bw, bh),
+            f"[c0]{motion_filter(effect, frames, w, h)},"
+            f"fps={FPS},setsar=1,format=yuv420p[cur]",
+        ]
+
+    if prev:
+        cmd += [
+            "-loop", "1", "-framerate", str(FPS),
+            "-t", f"{TRANS + 0.3:.2f}", "-i", prev,
+        ]
+        graph += [
+            compose("1:v", "1", bw, bh),
+            f"[c1]{end_state_filter(prev_effect, w, h)},"
+            f"fps={FPS},setsar=1,format=yuv420p[prv]",
+            f"[prv][cur]xfade=transition={transition}:"
+            f"duration={TRANS}:offset=0[x]",
+        ]
+        base, audio_idx = "x", 2
+    else:
+        base, audio_idx = "cur", 1
+
+    cmd += ["-i", audio]
+
+    post = f"[{base}]eq=contrast=1.05:saturation=1.12,vignette"
+
+    if (cues or (title and title.strip()) or card_text) and font:
+        ass_path = os.path.join(
+            folder, f"cap_{hashlib.md5(out.encode()).hexdigest()[:8]}.ass"
+        )
+        if write_ass(
+            ass_path, cues or [], size, font, size_ratio, LEAD,
+            title=title, title_style=title_style, title_pos=title_pos,
+            title_end=max(1.0, min(total - 0.3 - LEAD, 3.4)),
+            card=card_text, card_idx=card_idx, total=total,
+        ):
+            fdir = os.path.dirname(font)
+            post += f",ass=filename='{ass_path}':fontsdir='{fdir}'"
+
+    if not prev:
+        post += f",fade=t=in:st=0:d={TRANS}"
+    if is_last:
+        post += f",fade=t=out:st={max(0.0, total - 0.6):.3f}:d=0.6"
+
+    post += ",setsar=1,format=yuv420p[v]"
+    graph.append(post)
+
+    cmd += [
+        "-filter_complex", ";".join(graph),
+        "-map", "[v]",
+        "-map", f"{audio_idx}:a",
+        "-af",
+        "aresample=44100,aformat=channel_layouts=stereo,"
+        f"adelay={int(LEAD * 1000)}|{int(LEAD * 1000)},apad=pad_dur={pad}",
+        "-t", f"{total:.3f}",
+        "-r", str(FPS),
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+        "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-b:a", "160k", "-ar", "44100", "-ac", "2",
+        out,
+    ]
+
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr[-2500:])
+
+
+def join_clips(clips, folder, output, ffmpeg):
+    list_path = os.path.join(folder, "clips.txt")
+    with open(list_path, "w", encoding="utf-8") as f:
+        for c in clips:
+            f.write("file '{}'\n".format(c.replace("'", "'\\''")))
+
+    cmd = [
+        ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
+        "-f", "concat", "-safe", "0",
+        "-i", list_path,
+        "-c", "copy",
+        "-movflags", "+faststart",
+        output,
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr[-2500:])
+
+
+def add_music(video, music, out, volume, ffmpeg):
+    fc = (
+        "[0:a]volume=1.0[a0];"
+        f"[1:a]volume={volume}[a1];"
+        "[a0][a1]amix=inputs=2:duration=first:dropout_transition=0[mix];"
+        "[mix]volume=2.0[a]"
+    )
+    cmd = [
+        ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
+        "-i", video,
+        "-stream_loop", "-1", "-i", music,
+        "-filter_complex", fc,
+        "-map", "0:v", "-map", "[a]",
+        "-c:v", "copy", "-c:a", "aac", "-b:a", "160k",
+        "-shortest",
+        "-movflags", "+faststart",
+        out,
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr[-2500:])
+
+
+# ==== UI शुरू (परीक्षण में यहाँ से आगे का हिस्सा नहीं चलाया जाता) ====
+
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+
+# ---------------------------------------------------------------- बैकग्राउंड काम
+# काम एक अलग thread में चलता है और उसकी स्थिति सर्वर की याददाश्त में रहती है।
+# इसलिए फ़ोन की स्क्रीन बंद होने या ब्राउज़र छूटने पर भी वीडियो बनता रहता है।
+def save_project(P):
+    """स्थिति डिस्क पर रखें, ताकि ऐप रुकने के बाद भी काम लौटाया जा सके।"""
+    try:
+        data = {k: v for k, v in P.items() if k != "used"}
+        data["used"] = list(P.get("used", []))
+        path = os.path.join(P["folder"], "project.json")
+        with open(path + ".tmp", "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, default=list)
+        os.replace(path + ".tmp", path)
+    except Exception:
+        pass
+
+
+def load_saved_projects(jobs):
+    base = tempfile.gettempdir()
+    try:
+        names = os.listdir(base)
+    except Exception:
+        return
+    for name in names:
+        if not name.startswith("ravi_video_"):
+            continue
+        path = os.path.join(base, name, "project.json")
+        try:
+            if time.time() - os.path.getmtime(path) > 24 * 3600:
+                continue
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+            data["used"] = set(data.get("used", []))
+            data["hashes"] = list(data.get("hashes", []))
+            data["size"] = tuple(data.get("size") or (720, 1280))
+            for sc in data.get("scenes", []):
+                sc["cues"] = [tuple(c) for c in sc.get("cues", [])]
+            if data.get("state") in ("drafting", "rendering"):
+                if data.get("draft_done"):
+                    data["state"] = "ready"
+                    data["note"] = (
+                        "पिछली बार वीडियो बनते-बनते ऐप रुक गया था। "
+                        "'वीडियो बनाएँ' दबाएँ। जो क्लिप बन चुके हैं वे दोबारा नहीं बनेंगे।"
+                    )
+                elif data.get("scenes"):
+                    data["state"] = "error"
+                    data["error"] = "ड्राफ़्ट बनते समय ऐप रुक गया था।"
+                else:
+                    continue
+            jobs[data["id"]] = data
+        except Exception:
+            continue
+
+
+@st.cache_resource
+def get_jobs():
+    jobs = {}
+    load_saved_projects(jobs)
+    return jobs
+
+
+JOBS = get_jobs()
+
+for _id, _p in list(JOBS.items()):
+    if (
+        time.time() - _p.get("created", 0) > 6 * 3600
+        and _p["state"] not in ("drafting", "rendering")
+    ):
+        shutil.rmtree(_p.get("folder", ""), ignore_errors=True)
+        JOBS.pop(_id, None)
+
+
+def set_state(P, status=None, progress=None):
+    P["heartbeat"] = time.time()
+    if P.get("cancel"):
+        raise RuntimeError("आपके कहने पर रोक दिया गया।")
+    if status is not None:
+        P["status"] = status
+    if progress is not None:
+        P["progress"] = int(progress)
+
+
+def publish_static(P, path):
+    """वीडियो की ऐसी कॉपी रखें जिसका सीधा डाउनलोड लिंक बन सके।"""
+    P["static_name"] = ""
+    try:
+        base = os.path.dirname(os.path.abspath(__file__))
+        d = os.path.join(base, "static")
+        os.makedirs(d, exist_ok=True)
+        for old in os.listdir(d):
+            op = os.path.join(d, old)
+            if old.startswith("ravi_") and time.time() - os.path.getmtime(op) > 6 * 3600:
+                os.remove(op)
+        name = f"ravi_{P['id']}_{int(time.time())}.mp4"
+        shutil.copy(path, os.path.join(d, name))
+        P["static_name"] = name
+    except Exception:
+        P["static_name"] = ""
+
+
+def draft_job(P, cfg):
+    """आवाज़, कहानी की समझ, तस्वीर-योजना और तस्वीरें तैयार करता है। रुकने पर वहीं से आगे बढ़ सकता है।"""
+    try:
+        folder = P["folder"]
+        ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+        size = cfg["size"]
+        resume = bool(cfg.get("resume")) and bool(P.get("scenes"))
+
+        P["state"] = "drafting"
+        P["error"] = ""
+
+        # 1) आवाज़ (बन चुकी हो तो दोबारा नहीं बनती)
+        if not resume:
+            texts = split_scenes(P["script"], cfg["max_chars"])
+            n = len(texts)
+            set_state(P, "हिंदी आवाज़ बन रही है...", 1)
+            voices = asyncio.run(
+                make_voices(
+                    texts, cfg["voice"], folder, cfg["speed"], cfg["natural"],
+                    lambda i: set_state(P, None, 2 + (i + 1) / n * 23),
+                )
+            )
+            scenes = []
+            for text, (vpath, bounds) in zip(texts, voices):
+                vlen = audio_duration(vpath, ffmpeg)
+                scenes.append({
+                    "text": text,
+                    "headline": auto_headline(text),
+                    "voice_path": vpath,
+                    "voice_len": vlen,
+                    "cues": build_cues(text, bounds, vlen),
+                    "pad": round(random.uniform(0.3, 0.55), 2)
+                    if cfg["natural"] else 0.35,
+                    "image": None,
+                    "source": "",
+                    "query": "",
+                    "kind": "",
+                    "effect": "Default",
+                    "transition": "Default",
+                    "keep": True,
+                    "title": "",
+                    "title_style": "pop",
+                    "title_pos": "top",
+                })
+            P["scenes"] = scenes
+            P["offset"] = random.randint(0, 11)
+            save_project(P)
+        else:
+            scenes = P["scenes"]
+            n = len(scenes)
+
+        texts = [sc["text"] for sc in scenes]
+
+        # 2) कहानी की समझ (विषय, दौर, पुरुष/महिला, कितनी नई फोटो) और हर दृश्य की योजना
+        extra = cfg["extra_topic"].strip()
+        if not P.get("planned"):
+            set_state(P, "पूरी कहानी पढ़कर विषय, तारीख और पुरुष/महिला तय हो रहे हैं...", 26)
+            key = cfg["gemini_key"]
+            topic = extra or translate_hi_en(P["script"], 600) or P["script"][:200]
+            anchor = extra
+            plans = [None] * n
+            era = ""
+            ctx = {}
+            if key:
+                g_models, _ = gemini_models(key)
+                data, aerr = analyze_story(P["script"], extra, key, g_models or GEMINI_MODELS)
+                if data:
+                    ctx = normalize_ctx(data)
+                    topic = extra or ctx.get("topic_en") or topic
+                    anchor = anchor or ctx.get("anchor", "")
+                set_state(P, "हर दृश्य की फोटो-योजना बन रही है...", 28)
+                g_anchor, plans, err, era = plan_with_ai(
+                    texts, P["script"], key, ctx=ctx, topic=topic, anchor=anchor
+                )
+                if not any(plans):
+                    P["note"] = (
+                        "Gemini से योजना नहीं बन सकी, सामान्य तरीका इस्तेमाल हुआ। "
+                        f"कारण: {err or aerr}"
+                    )
+                anchor = anchor or g_anchor
+            if not anchor:
+                kws = english_keywords(topic)
+                anchor = kws[0] if kws else ""
+
+            modern = era.startswith("modern") if era else guess_modern(
+                topic, P["script"], extra
+            )
+            blob = f"{topic} {anchor} {extra} {P['script'][:1500]}"
+
+            gender = cfg.get("gender", "auto")
+            if gender == "auto":
+                gender = ctx.get("gender", "none") if ctx else guess_gender(blob)
+
+            fresh_code = cfg.get("fresh", "auto")
+            rec = ctx.get("recency", "")
+            if fresh_code == "auto":
+                tl = REC_TO_TL[rec] if rec else ("m" if modern else "")
+            else:
+                tl = fresh_code
+            yf = (TODAY - datetime.timedelta(days=TL_DAYS[tl])).year if tl else None
+            if fresh_code == "auto" and rec == "3y":
+                yf = TODAY.year - 3
+
+            must = list(ctx.get("must_any") or [])
+            for wd in re.findall(r"[a-z]{3,}", f"{anchor} {extra}".lower()):
+                if wd not in must and wd not in STOPWORDS:
+                    must.append(wd)
+            ctx = dict(ctx)
+            ctx.update(gender=gender or "none", must_any=must[:10],
+                       off_topic=list(ctx.get("off_topic") or []))
+
+            for sc_, pl in zip(scenes, plans):
+                hl = str((pl or {}).get("headline") or "").strip()
+                if hl:
+                    sc_["headline"] = hl
+
+            P.update(anchor=anchor, topic=topic, modern=modern or bool(tl),
+                     plans=plans, planned=True, timelimit=tl, year_from=yf,
+                     ctx=ctx, domain_ex=domain_excludes(blob))
+            save_project(P)
+
+        anchor, topic, modern = P["anchor"], P["topic"], P["modern"]
+        tl = P.get("timelimit", "m" if modern else "")
+        plans = P.get("plans") or [None] * n
+
+        # Gemini से हर तस्वीर की जाँच (key हो और चालू हो तो)
+        gem = None
+        if cfg["gemini_key"] and cfg.get("verify", True):
+            g_models, _ = gemini_models(cfg["gemini_key"])
+            gem = {"key": cfg["gemini_key"], "models": g_models or GEMINI_MODELS}
+
+        # 3) तस्वीरें: पहले सब दृश्यों की खोज साथ-साथ (तेज़), फिर बचे हुए के लिए AI / टेक्स्ट कार्ड
+        used = P["used"]
+        hashes = P.setdefault("hashes", [])
+        uploads = cfg["uploads"]
+        lib = P.setdefault("library", [])
+
+        todo = []
+        for i, sc in enumerate(scenes):
+            if sc.get("image") and os.path.exists(sc["image"]):
+                continue
+            path = os.path.join(folder, f"scene_{i}_0.jpg")
+            if i < len(uploads):
+                shutil.copy(uploads[i], path)
+                sc.update(image=path, source="आपकी तस्वीर", query="", kind="photo")
+                try:
+                    hashes.append(ahash_file(path))
+                except Exception:
+                    pass
+                lib.append({"path": path, "label": "आपकी तस्वीर"})
+                continue
+            todo.append(i)
+
+        def scene_plan(i):
+            plan = plans[i] if i < len(plans) else None
+            qs, exclude = [], []
+            if plan:
+                raw = plan.get("queries")
+                if not isinstance(raw, list):
+                    raw = [plan.get("query")] if plan.get("query") else []
+                qs = [with_anchor(str(q).strip(), anchor) for q in raw if str(q or "").strip()][:2]
+                ex = plan.get("exclude") or []
+                exclude = [str(e) for e in ex] if isinstance(ex, list) else []
+                if qs and anchor and anchor not in qs:
+                    qs.append(anchor)
+            return plan, qs, exclude
+
+        def search_scene(i):
+            sc = scenes[i]
+            path = os.path.join(folder, f"scene_{i}_0.jpg")
+            log = []
+            plan, queries, exclude = scene_plan(i)
+            english = ""
+            if not queries:
+                queries, english = scene_queries(sc["text"], topic, anchor)
+            if not english:
+                english = translate_hi_en(sc["text"])
+            rules = make_rules(P, exclude, vision=bool(gem))
+            source, query = smart_photo(
+                queries, path, folder, f"s{i}", cfg["pixabay_key"], cfg["use_web"],
+                anchor, modern, tl, gem, english or sc["text"], topic,
+                exclude, log, used, rules=rules,
+            )
+            return {"i": i, "path": path, "source": source, "query": query,
+                    "log": log, "plan": plan, "english": english,
+                    "exclude": exclude}
+
+        found = {}
+        if todo:
+            done_n = 0
+            with ThreadPoolExecutor(max_workers=3) as pool:
+                futs = [pool.submit(search_scene, i) for i in todo]
+                try:
+                    for fut in as_completed(futs):
+                        r = fut.result()
+                        found[r["i"]] = r
+                        done_n += 1
+                        set_state(
+                            P, f"सही तस्वीरें खोज रहे हैं: {done_n}/{len(todo)}",
+                            27 + done_n / len(todo) * 45,
+                        )
+                except BaseException:
+                    for f_ in futs:
+                        f_.cancel()
+                    raise
+
+        for i, sc in enumerate(scenes):
+            if i not in found:
+                continue
+
+            r = found[i]
+            path, source, query = r["path"], r["source"], r["query"]
+            log, plan, english, exclude = r["log"], r["plan"], r["english"], r["exclude"]
+            ai_err = []
+            rules = make_rules(P, exclude, vision=bool(gem))
+            set_state(P, f"बाकी तस्वीरें पूरी कर रहे हैं: दृश्य {i + 1}/{n}",
+                      72 + (i + 1) / n * 26)
+
+            if not source and cfg["use_ai"]:
+                set_state(P, f"मेल खाती असली फोटो नहीं मिली, सही विषय की AI फोटो बना रहे हैं: दृश्य {i + 1}")
+                if plan and plan.get("ai"):
+                    prompt = str(plan["ai"])
+                else:
+                    prompt = visual_prompt(sc["text"], topic, anchor, english)
+                if prompt and ai_verified(prompt, path, size, ai_err, gem, rules,
+                                          topic, english or sc["text"]):
+                    source, query = "AI", prompt[:120]
+                elif not prompt:
+                    ai_err.append("दृश्य का तस्वीर-विवरण नहीं बन सका")
+
+            if not source and gem and anchor:
+                set_state(P, f"विषय से जुड़ी सामान्य तस्वीर खोज रहे हैं: दृश्य {i + 1}")
+                source, query = smart_photo(
+                    [anchor], path, folder, f"g{i}", cfg["pixabay_key"], cfg["use_web"],
+                    anchor, modern, tl, gem, english or sc["text"], topic,
+                    exclude, log, used, rules=rules,
+                )
+
+            if source:
+                sc.update(image=path, source=source, query=query,
+                          kind="ai" if source == "AI" else "photo")
+                lib.append({"path": path, "label": f"{source}: {query[:40]}"})
+            else:
+                # कभी सादा रंग या पुरानी तस्वीर नहीं: दृश्य के शब्द बड़े अक्षरों में दिखेंगे
+                make_fallback_image(path, size)
+                sc.update(image=path, source="टेक्स्ट कार्ड", query="", kind="card")
+                P.setdefault("missing", []).append(i + 1)
+
+            if ai_err and sc["source"] != "AI":
+                log.append("AI: " + "; ".join(sorted(set(ai_err))))
+            sc["log"] = log
+            save_project(P)
+
+        if P.get("missing"):
+            P["note"] = (P.get("note", "") +
+                         f" इन दृश्यों की सही, मेल खाती फोटो नहीं मिली: {sorted(set(P['missing']))}। "
+                         "इनमें दृश्य के शब्द बड़े अक्षरों में टेक्स्ट कार्ड की तरह दिखेंगे। "
+                         "एडिटर में 'नई फोटो खोजो' या अपनी फोटो लगा सकते हैं। "
+                         "कारण जानने के लिए 'तस्वीर कैसे चुनी गई' खोलें।").strip()
+
+        P["draft_done"] = True
+        set_state(P, "ड्राफ़्ट तैयार है", 100)
+        P["state"] = "rendering" if cfg.get("chain") else "ready"
+        save_project(P)
+
+    except Exception as e:
+        P["state"] = "error"
+        P["error"] = str(e)
+        save_project(P)
+
+
+def resolve_effects(kept, off, default_effect, default_transition):
+    """रखे गए हर दृश्य का असली इफेक्ट और ट्रांज़िशन (Default/Auto सुलझाकर)।"""
+    effects, trans = [], []
+    for idx, sc in enumerate(kept):
+        e = sc["effect"] if sc["effect"] != "Default" else default_effect
+        if e.startswith("Auto"):
+            e = EFFECTS[(idx + off) % len(EFFECTS)]
+        if sc.get("video"):
+            e = "Static"  # अपने वीडियो पर ज़ूम नहीं लगता
+        t = sc["transition"] if sc["transition"] != "Default" else default_transition
+        if t.startswith("Auto"):
+            t = TRANSITIONS[(idx * 5 + off) % len(TRANSITIONS)]
+        effects.append(e)
+        trans.append(t)
+    return effects, trans
+
+
+def card_text_for(sc, font):
+    """टेक्स्ट कार्ड वाले दृश्य के लिए बड़े अक्षरों का वाक्यांश (वरना None)।"""
+    if font and sc.get("kind") == "card" and not sc.get("video"):
+        return (sc.get("headline") or auto_headline(sc["text"])) or None
+    return None
+
+
+def preview_clip(P, sel, size, default_effect, default_transition, captions, cap_ratio):
+    """एक दृश्य की छोटी झलक (कम क्वालिटी, जल्दी बनती है)।"""
+    ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+    scenes = P["scenes"]
+    kept = [s_ for s_ in scenes if s_["keep"] or s_ is scenes[sel]]
+    pos = next(i for i, s_ in enumerate(kept) if s_ is scenes[sel])
+    effects, trans = resolve_effects(
+        kept, P.get("offset", 0), default_effect, default_transition
+    )
+    sc = kept[pos]
+    prev = (kept[pos - 1].get("end_image") or kept[pos - 1]["image"]) if pos > 0 else None
+    prev_eff = effects[pos - 1] if pos > 0 else None
+    font = get_caption_font() if (captions or sc.get("kind") == "card") else None
+    out = os.path.join(P["folder"], f"preview_{int(time.time() * 1000) % 10**9}.mp4")
+    make_clip(
+        sc["image"], prev, prev_eff, sc["voice_path"], sc["voice_len"],
+        sc["cues"] if (font and captions) else None, out, size, effects[pos], trans[pos],
+        ffmpeg, font, cap_ratio, P["folder"], sc["pad"], False,
+        title=(sc.get("title") or "").strip(),
+        title_style=sc.get("title_style", "pop"),
+        title_pos=sc.get("title_pos", "top"), video=sc.get("video"),
+        card_text=card_text_for(sc, font), card_idx=card_idx_for(sc["image"]),
+    )
+    return out
+
+
+def render_job(P, cfg):
+    """चुनी हुई तस्वीरों, इफेक्ट और ट्रांज़िशन से अंतिम वीडियो बनाता है।"""
+    try:
+        folder = P["folder"]
+        ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+        size = cfg["size"]
+        P["error"] = ""
+        kept = [dict(s) for s in P["scenes"] if s["keep"]]
+        n = len(kept)
+        if n == 0:
+            raise RuntimeError("कम से कम एक दृश्य रखना ज़रूरी है।")
+
+        font = None
+        need_font = cfg["captions"] or any(s.get("kind") == "card" for s in kept)
+        if need_font:
+            font = get_caption_font()
+            if not font:
+                P["note"] = ("हिंदी फ़ॉन्ट नहीं मिला, इसलिए कैप्शन और टेक्स्ट कार्ड के "
+                             "शब्द वीडियो में नहीं दिखेंगे।")
+
+        off = P.get("offset", 0)
+
+        # हर दृश्य का इफेक्ट और ट्रांज़िशन तय करें
+        effects, trans = resolve_effects(
+            kept, off, cfg["default_effect"], cfg["default_transition"]
+        )
+
+        plan_jobs = []
+        for idx, sc in enumerate(kept):
+            prev = (kept[idx - 1].get("end_image") or kept[idx - 1]["image"]) if idx > 0 else None
+            prev_eff = effects[idx - 1] if idx > 0 else None
+            title = (sc.get("title") or "").strip()
+            cues = sc["cues"] if (font and cfg["captions"]) else None
+            card = card_text_for(sc, font)
+            cidx = card_idx_for(sc["image"])
+            sig = repr((
+                sc["image"], os.path.getmtime(sc["image"]),
+                prev, prev_eff, effects[idx], trans[idx] if prev else "",
+                sc["voice_path"], os.path.getmtime(sc["voice_path"]),
+                cues, font, size,
+                cfg["cap_ratio"], sc["pad"], idx == n - 1,
+                title, sc.get("title_style"), sc.get("title_pos"),
+                sc.get("video"),
+                os.path.getmtime(sc["video"]) if sc.get("video") and os.path.exists(sc["video"]) else 0,
+                card, cidx,
+            ))
+            key = hashlib.md5(sig.encode()).hexdigest()[:16]
+            plan_jobs.append({
+                "idx": idx, "sc": sc, "prev": prev, "prev_eff": prev_eff,
+                "effect": effects[idx], "trans": trans[idx], "title": title,
+                "cues": cues, "card": card, "cidx": cidx,
+                "clip": os.path.join(folder, f"clip_{key}.mp4"),
+            })
+
+        pending = [j for j in plan_jobs if not os.path.exists(j["clip"])]
+        reused = len(plan_jobs) - len(pending)
+
+        def build(j):
+            sc = j["sc"]
+            tmp = j["clip"] + ".part.mp4"
+            make_clip(
+                sc["image"], j["prev"], j["prev_eff"], sc["voice_path"],
+                sc["voice_len"], j["cues"], tmp,
+                size, j["effect"], j["trans"], ffmpeg, font,
+                cfg["cap_ratio"], folder, sc["pad"], j["idx"] == n - 1,
+                title=j["title"], title_style=sc.get("title_style", "pop"),
+                title_pos=sc.get("title_pos", "top"), video=sc.get("video"),
+                card_text=j["card"], card_idx=j["cidx"],
+            )
+            os.replace(tmp, j["clip"])
+
+        if pending:
+            workers = 2 if (os.cpu_count() or 2) <= 2 else min(4, (os.cpu_count() or 4) // 2)
+            msg = f"{reused} क्लिप पहले से बने मिले, " if reused else ""
+            done_n = 0
+            set_state(P, f"{msg}{len(pending)} क्लिप बन रहे हैं...", 2)
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                futs = [pool.submit(build, j) for j in pending]
+                try:
+                    for fut in as_completed(futs):
+                        fut.result()
+                        done_n += 1
+                        set_state(
+                            P, f"{msg}क्लिप बने: {done_n}/{len(pending)}",
+                            2 + done_n / len(pending) * 88,
+                        )
+                except BaseException:
+                    for f_ in futs:
+                        f_.cancel()
+                    raise
+        else:
+            set_state(P, f"सभी {n} क्लिप पहले से बने हुए हैं", 90)
+
+        clips = [j["clip"] for j in plan_jobs]
+
+        set_state(P, "पूरा वीडियो जोड़ा जा रहा है...", 92)
+        stamp = int(time.time())
+        joined = os.path.join(folder, f"video_{stamp}.mp4")
+        join_clips(clips, folder, joined, ffmpeg)
+
+        final = joined
+        if cfg.get("music") and os.path.exists(cfg["music"]):
+            set_state(P, "पृष्ठभूमि संगीत जोड़ा जा रहा है...", 96)
+            final = os.path.join(folder, f"video_{stamp}_music.mp4")
+            try:
+                add_music(joined, cfg["music"], final, cfg["music_vol"], ffmpeg)
+            except Exception as e:
+                final = joined
+                P["note"] = ("संगीत जुड़ नहीं सका, इसलिए वीडियो बिना संगीत के बना। कारण: "
+                             + str(e)[-200:])
+
+        P["video"] = final
+        publish_static(P, final)
+        set_state(P, "वीडियो तैयार है!", 100)
+        P["state"] = "done"
+        save_project(P)
+
+    except Exception as e:
+        P["state"] = "error"
+        P["error"] = str(e)
+
+
+def full_job(P, cfg):
+    """कहानी से तैयार वीडियो तक पूरा काम (रुकने पर वहीं से आगे बढ़ता है)।"""
+    P["cancel"] = False
+    if not P.get("draft_done"):
+        draft_job(P, dict(cfg, chain=True))
+        if not P.get("draft_done"):
+            return
+    P["state"] = "rendering"
+    P["progress"] = 0
+    render_job(P, cfg["render"])
+
+
+def make_silent_audio(path, seconds, ffmpeg):
+    cmd = [
+        ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
+        "-f", "lavfi", "-i", "anullsrc=r=24000:cl=mono",
+        "-t", str(seconds), "-q:a", "9", path,
+    ]
+    subprocess.run(cmd, check=True, capture_output=True, timeout=120)
+
+
+def new_scene(P, text, image, source="आपकी तस्वीर", query=""):
+    """नया दृश्य: शब्द हों तो आवाज़ बनती है, नहीं तो 3 सेकंड की चुप्पी।"""
+    ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+    uid = int(time.time() * 1000) % 10**9
+    text = (text or "").strip()
+    if text:
+        vp = os.path.join(P["folder"], f"voice_new_{uid}.mp3")
+        rate, pitch = voice_params(text, P.get("speed", -5), P.get("natural", True))
+        bounds = asyncio.run(synth(text, P["voice"], vp, rate, pitch))
+        vlen = audio_duration(vp, ffmpeg)
+        cues = build_cues(text, bounds, vlen)
+    else:
+        vp = os.path.join(P["folder"], f"voice_new_{uid}.mp3")
+        make_silent_audio(vp, 3.0, ffmpeg)
+        vlen, cues = 3.0, []
+    return {
+        "text": text or "(बिना आवाज़ का दृश्य)", "voice_path": vp, "voice_len": vlen,
+        "cues": cues, "pad": 0.35, "image": image, "source": source,
+        "query": query, "effect": "Default", "transition": "Default",
+        "keep": True, "title": "", "title_style": "pop", "title_pos": "top",
+        "log": [], "headline": auto_headline(text),
+        "kind": "card" if str(source).startswith("खाली") else "photo",
+    }
+
+
+def import_voice(P, src_path, text):
+    """अपनी रिकॉर्ड/अपलोड की आवाज़ को दृश्य की आवाज़ बनाने के लिए तैयार करता है।"""
+    ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+    uid = int(time.time() * 1000) % 10**9
+    out = os.path.join(P["folder"], f"voice_own_{uid}.mp3")
+    subprocess.run(
+        [ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-i", src_path,
+         "-vn", "-ac", "1", "-ar", "24000", "-q:a", "4", out],
+        check=True, capture_output=True, timeout=300,
+    )
+    vlen = audio_duration(out, ffmpeg)
+    return out, vlen, build_cues(text, [], vlen)
+
+
+def import_video(P, src_path, text="", start=0.0, length=60.0, keep_audio=True):
+    """अपना वीडियो-क्लिप एक नए दृश्य की तरह तैयार करता है।"""
+    ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+    uid = int(time.time() * 1000) % 10**9
+    folder = P["folder"]
+    length = max(1.0, min(float(length), 180.0))
+    norm = os.path.join(folder, f"vid_{uid}.mp4")
+    r = subprocess.run(
+        [ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
+         "-ss", str(max(0.0, start)), "-t", str(length), "-i", src_path, "-an",
+         "-vf", "scale='min(1280,iw)':-2,fps=24,format=yuv420p",
+         "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", norm],
+        capture_output=True, text=True, timeout=900,
+    )
+    if r.returncode != 0 or not os.path.exists(norm):
+        raise RuntimeError("यह वीडियो खुल नहीं सका: " + r.stderr[-200:])
+    vdur = audio_duration(norm, ffmpeg)
+
+    thumb = os.path.join(folder, f"vthumb_{uid}.jpg")
+    endf = os.path.join(folder, f"vend_{uid}.jpg")
+    subprocess.run(
+        [ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
+         "-ss", str(vdur / 2), "-i", norm, "-frames:v", "1", thumb],
+        capture_output=True, timeout=120,
+    )
+    subprocess.run(
+        [ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
+         "-sseof", "-0.3", "-i", norm, "-frames:v", "1", endf],
+        capture_output=True, timeout=120,
+    )
+    if not os.path.exists(thumb):
+        make_fallback_image(thumb, P.get("size", (720, 1280)))
+    if not os.path.exists(endf):
+        shutil.copy(thumb, endf)
+
+    text = (text or "").strip()
+    vp = os.path.join(folder, f"voice_vid_{uid}.mp3")
+    if text:
+        rate, pitch = voice_params(text, P.get("speed", -5), P.get("natural", True))
+        bounds = asyncio.run(synth(text, P["voice"], vp, rate, pitch))
+        vlen = audio_duration(vp, ffmpeg)
+        cues = build_cues(text, bounds, vlen)
+    else:
+        vlen, cues = vdur, []
+        got_audio = False
+        if keep_audio:
+            r2 = subprocess.run(
+                [ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
+                 "-ss", str(max(0.0, start)), "-t", str(length), "-i", src_path,
+                 "-vn", "-ac", "1", "-ar", "24000", "-q:a", "4", vp],
+                capture_output=True, timeout=300,
+            )
+            got_audio = r2.returncode == 0 and os.path.exists(vp)
+        if not got_audio:
+            make_silent_audio(vp, vdur, ffmpeg)
+
+    return {
+        "text": text or "(आपका वीडियो-क्लिप)", "voice_path": vp, "voice_len": vlen,
+        "cues": cues, "pad": 0.2, "image": thumb, "end_image": endf, "video": norm,
+        "source": "आपका वीडियो", "query": "", "effect": "Default",
+        "transition": "Default", "keep": True, "title": "", "title_style": "pop",
+        "title_pos": "top", "log": [], "kind": "video", "headline": "",
+    }
+
+
+def start_thread(fn, P, cfg):
+    t = threading.Thread(target=fn, args=(P, cfg), daemon=True)
+    t.start()
+
+
+
+# ==== UI ====
+import copy
+
+QUALITIES = ["HD 1080p (बेहतर, धीमा)", "सामान्य 720p (तेज़)"]
+EFFECT_NAMES = {
+    "Default": "सेटिंग वाला (डिफ़ॉल्ट)",
+    "Zoom In": "धीरे-धीरे पास आना (Zoom In)",
+    "Zoom Out": "धीरे-धीरे दूर जाना (Zoom Out)",
+    "Pan Left to Right": "बाएँ से दाएँ घूमना (Pan →)",
+    "Pan Right to Left": "दाएँ से बाएँ घूमना (Pan ←)",
+    "Pan Up": "नीचे से ऊपर उठना (Pan ↑)",
+    "Pan Down": "ऊपर से नीचे उतरना (Pan ↓)",
+    "Drift Zoom": "तिरछा बहता ज़ूम (Drift)",
+    "Handheld": "हाथ में कैमरा जैसी हल्की हलचल",
+}
+TRANS_NAMES = {
+    "Default": "सेटिंग वाला (डिफ़ॉल्ट)",
+    "fade": "धीरे से बदलना (Fade)",
+    "slideleft": "बाएँ खिसकना",
+    "slideright": "दाएँ खिसकना",
+    "wipeleft": "बाएँ पोंछना",
+    "wiperight": "दाएँ पोंछना",
+    "circleopen": "गोला खुलना",
+    "dissolve": "घुल जाना",
+    "smoothright": "दाएँ चिकना",
+    "slideup": "ऊपर खिसकना",
+    "slidedown": "नीचे खिसकना",
+    "radial": "घूमता हुआ खुलना",
+    "zoomin": "ज़ूम वाला बदलाव",
+    "fadewhite": "सफ़ेद चमक",
+}
+TITLE_STYLES = {"pop": "उभरकर आना (Pop)", "slide": "ऊपर से सरकना (Slide)", "fade": "धीरे से आना (Fade)"}
+TITLE_POS = {"top": "ऊपर", "center": "बीच में"}
+FRESH_OPTIONS = {
+    "📰 आज / ताज़ा (24 घंटे)": "d",
+    "🗓️ इस हफ़्ते की": "w",
+    "📆 इस महीने की": "m",
+    "📅 पिछले 1 साल की": "y",
+    "🏛️ कोई भी समय (ऐतिहासिक विषय)": "",
+}
+NEW_FRESH = {"🤖 अपने आप (विषय देखकर)": "auto", **FRESH_OPTIONS}
+
+DEFAULTS = {
+    "script": "", "voice_name": list(VOICES.keys())[0], "speed": -5, "natural": True,
+    "format_name": list(FORMATS.keys())[0], "quality": QUALITIES[0], "max_chars": 110,
+    "use_web": True, "use_ai": True, "extra_topic": "",
+    "fresh_name": "🤖 अपने आप (विषय देखकर)", "verify": True,
+    "gender_name": "अपने-आप पहचाने",
     "captions_on": True, "cap_name": "मध्यम",
     "effect_choice": "Auto (हर दृश्य में अलग)", "transition_choice": "Auto (हर दृश्य अलग)",
     "gemini_key": "", "pixabay_key": "",
@@ -2417,6 +5501,7 @@ def make_cfg(resume=False, uploads=None):
         "gemini_key": eff_gemini(), "pixabay_key": eff_pixabay(),
         "extra_topic": S["extra_topic"], "uploads": uploads or [],
         "fresh": NEW_FRESH.get(S["fresh_name"], "auto"), "verify": S["verify"],
+        "gender": GENDER_LABELS.get(S["gender_name"], "auto"),
         "render": render_cfg(),
     }
 
@@ -2437,10 +5522,35 @@ def apply_image(sel, src_path, source, query, flash=True):
     newp = os.path.join(P["folder"], f"scene_{sel}_{int(time.time() * 1000) % 10**9}.jpg")
     shutil.copy(src_path, newp)
     sc.setdefault("history", []).append((sc["image"], sc["source"], sc["query"]))
-    sc.update(image=newp, source=source, query=query)
+    sc.update(image=newp, source=source, query=query,
+              kind="ai" if source == "AI" else "photo")
+    try:
+        P.setdefault("hashes", []).append(ahash_file(newp))
+    except Exception:
+        pass
     if flash:
         st.session_state["flash"] = f"✅ दृश्य {sel + 1} में नई फोटो लग गई ({source})"
     save_project(P)
+
+
+def set_card(sel):
+    """इस दृश्य की फोटो हटाकर टेक्स्ट कार्ड (बड़े अक्षरों में दृश्य के शब्द) लगाता है।"""
+    sc = P["scenes"][sel]
+    ph = os.path.join(P["folder"], f"scene_{sel}_card_{int(time.time() * 1000) % 10**9}.jpg")
+    make_fallback_image(ph, P["size"])
+    sc.setdefault("history", []).append((sc["image"], sc["source"], sc["query"]))
+    sc.update(image=ph, source="टेक्स्ट कार्ड", query="", kind="card")
+    if not (sc.get("headline") or "").strip():
+        sc["headline"] = auto_headline(sc["text"])
+
+
+def rules_for(P_, tl_code=None):
+    """एडिटर की खोज के नियम: प्रोजेक्ट का विषय/पुरुष-महिला/ग़लत शब्द + चुनी हुई ताज़गी।"""
+    rules = make_rules(P_, None, vision=bool(eff_gemini() and S["verify"]))
+    tl_ = P_.get("timelimit", "") if tl_code is None else tl_code
+    rules["year_from"] = (TODAY - datetime.timedelta(days=TL_DAYS[tl_])).year if tl_ else None
+    rules["rec_txt"] = TL_TEXT.get(tl_, "any date")
+    return rules
 
 
 def add_to_library(path, label):
@@ -2535,7 +5645,7 @@ elif page == "✍️ नया":
         value=S["use_web"], key="w_web",
     )
     S["use_ai"] = st.checkbox(
-        "🤖 मेल खाती तस्वीर न मिले तो AI से बनाएँ", value=S["use_ai"], key="w_ai"
+        "🤖 असली फोटो न मिले तो सही विषय की AI फोटो बनाएँ", value=S["use_ai"], key="w_ai"
     )
     fresh_keys = list(NEW_FRESH.keys())
     S["fresh_name"] = st.selectbox(
@@ -2545,13 +5655,21 @@ elif page == "✍️ नया":
         help="आज के मैच/ख़बर की कहानी हो तो 'आज / ताज़ा' या 'इस हफ़्ते' चुनें। "
              "ऐतिहासिक कहानी (जैसे बेबीलोन) हो तो 'कोई भी समय' चुनें।",
     )
+    gender_keys = list(GENDER_LABELS.keys())
+    S["gender_name"] = st.selectbox(
+        "👥 फोटो में कौन? (पुरुष / महिला)", gender_keys,
+        index=gender_keys.index(S["gender_name"]) if S["gender_name"] in gender_keys else 0,
+        key="w_gender",
+        help="महिला चुनने पर सिर्फ महिलाओं की फोटो (जैसे महिला क्रिकेट), पुरुष चुनने पर सिर्फ "
+             "पुरुषों की फोटो आएगी। 'अपने-आप' में AI कहानी पढ़कर तय करता है।",
+    )
     S["verify"] = st.checkbox(
-        "🧐 Gemini से हर फोटो की जाँच कराएँ (गलत/पुरानी फोटो हटती है; Gemini key चाहिए)",
+        "🧐 Gemini से हर फोटो की जाँच कराएँ (गलत/पुरानी/बेमेल फोटो हटती है; Gemini key चाहिए)",
         value=S["verify"], key="w_verify",
     )
     S["extra_topic"] = st.text_input(
         "कहानी का मुख्य विषय English में (वैकल्पिक, हर खोज में जुड़ेगा)",
-        value=S["extra_topic"], placeholder="Babylon  /  India vs Australia ODI 2026",
+        value=S["extra_topic"], placeholder="Babylon  /  India women vs Australia women ODI 2026",
         key="w_topic",
     )
     uploaded_images = st.file_uploader(
@@ -2594,8 +5712,9 @@ elif page == "✍️ नया":
             "created": time.time(), "heartbeat": time.time(),
             "script": S["script"], "draft_done": False, "planned": False,
             "status": "शुरू हो रहा है...", "progress": 0,
-            "note": "", "error": "", "scenes": [], "used": set(), "video": None,
+            "note": "", "error": "", "scenes": [], "used": set(), "hashes": [], "video": None,
             "anchor": "", "topic": "", "modern": False, "offset": 0,
+            "ctx": {}, "domain_ex": [], "timelimit": "", "year_from": None,
             "voice": VOICES[S["voice_name"]], "speed": S["speed"], "natural": S["natural"],
             "size": hd, "cancel": False, "static_name": "", "library": [],
         }
@@ -2677,7 +5796,9 @@ elif page == "🎞️ एडिटर":
                 "3. **नई फोटो लगाएँ** में तरीका चुनें: गैलरी, इंटरनेट, AI या लाइब्रेरी।\n"
                 "4. इंटरनेट में **✨ अपने आप सबसे सही फोटो लगाएँ** दबाएँ, या **🔍 विकल्प खोजें** से 6 फोटो देखकर "
                 "जिसे चाहें उसके नीचे **✅ लगाएँ** दबाएँ।\n"
-                "5. सारे बदलाव के बाद सबसे नीचे **🎬 वीडियो बनाएँ / दोबारा बनाएँ** दबाएँ।"
+                "5. सारे बदलाव के बाद सबसे नीचे **🎬 वीडियो बनाएँ / दोबारा बनाएँ** दबाएँ।\n\n"
+                "🔤 जिस दृश्य में सही फोटो न मिले, वहाँ दृश्य के शब्द बड़े अक्षरों में टेक्स्ट कार्ड की तरह दिखते हैं। "
+                "वे शब्द **🖼️ फोटो** में 'कार्ड पर लिखे शब्द' से बदल सकते हैं।"
             )
 
         # ---------- चुना हुआ दृश्य (पहले से सेट, ताकि widget बनने से पहले बदला जा सके)
@@ -2703,8 +5824,10 @@ elif page == "🎞️ एडिटर":
                         st.image(get_thumb(sc_["image"]), use_container_width=True)
                     mark = "🚫" if not sc_["keep"] else ""
                     title_mark = "🔠" if (sc_.get("title") or "").strip() else ""
+                    card_mark = "🔤" if sc_.get("kind") == "card" else ""
                     st.button(
-                        f"{i + 1}{mark}{title_mark}", key=f"tl_{i}", on_click=_select, args=(i,),
+                        f"{i + 1}{mark}{title_mark}{card_mark}", key=f"tl_{i}", on_click=_select,
+                        args=(i,),
                         type="primary" if i == st.session_state["sel"] else "secondary",
                         use_container_width=True,
                     )
@@ -2746,15 +5869,23 @@ elif page == "🎞️ एडिटर":
                     st.rerun()
             a1, a2 = st.columns(2)
             if a1.button("🗑️ यह फोटो हटाएँ", key=f"rm_{sel}", use_container_width=True):
-                ph = os.path.join(P["folder"], f"scene_{sel}_blank_{int(time.time() * 1000) % 10**9}.jpg")
-                make_fallback_image(ph, P["size"], [], None, title=P.get("anchor", ""))
-                sc.setdefault("history", []).append((sc["image"], sc["source"], sc["query"]))
-                sc.update(image=ph, source="खाली (नई फोटो लगाएँ)", query="")
+                set_card(sel)
                 st.rerun()
             if sc.get("history") and a2.button("↩️ पिछली फोटो", key=f"undo_{sel}",
                                                 use_container_width=True):
                 img_p, src_p, q_p = sc["history"].pop()
-                sc.update(image=img_p, source=src_p, query=q_p)
+                sc.update(image=img_p, source=src_p, query=q_p,
+                          kind="card" if str(src_p).startswith(("टेक्स्ट कार्ड", "खाली")) else "photo")
+                st.rerun()
+
+            st.markdown("**🔤 टेक्स्ट कार्ड (फोटो न हो तो शब्द बड़े अक्षरों में)**")
+            sc["headline"] = st.text_input(
+                "कार्ड पर लिखे शब्द (2-5 शब्द अच्छे लगते हैं)",
+                value=sc.get("headline") or auto_headline(sc["text"]), key=f"hl_{sel}",
+            )
+            if st.button("🔤 इस दृश्य में टेक्स्ट कार्ड लगाएँ", key=f"card_{sel}",
+                         use_container_width=True):
+                set_card(sel)
                 st.rerun()
 
             st.markdown("**➕ नई फोटो लगाएँ**")
@@ -2786,7 +5917,7 @@ elif page == "🎞️ एडिटर":
                 q = st.text_input(
                     "English शब्द (जितने सटीक, उतना अच्छा)",
                     value=(sc["query"] if sc["source"].split(" ")[0] in ("इंटरनेट", "Wikimedia", "Openverse", "Pixabay", "Bing", "समाचार-फोटो") else ""),
-                    key=f"q_{sel}", placeholder="India vs Australia ODI 2026",
+                    key=f"q_{sel}", placeholder="India women vs Australia women ODI 2026",
                 )
                 fr_names = list(FRESH_OPTIONS.keys())
                 fr_codes = list(FRESH_OPTIONS.values())
@@ -2814,14 +5945,14 @@ elif page == "🎞️ एडिटर":
                         src_, q_used = smart_photo(
                             [qq], newp, P["folder"], f"m{sel}", eff_pixabay(), S["use_web"],
                             "", P.get("modern", False) or bool(tl_sel), tl_sel, gem, english,
-                            P.get("topic", ""), [], alog, set(),
+                            P.get("topic", ""), [], alog, P["used"], rules=rules_for(P, tl_sel),
                         )
                     if src_:
                         add_to_library(newp, f"{src_}: {qq[:30]}")
                         apply_image(sel, newp, src_, qq)
                         st.rerun()
                     else:
-                        st.warning("सही फोटो नहीं मिली। शब्द बदलें, समय-सीमा बढ़ाएँ या AI से बनवाएँ।")
+                        st.warning("सही फोटो नहीं मिली। शब्द बदलें, समय-सीमा बढ़ाएँ, AI से बनवाएँ या टेक्स्ट कार्ड लगाएँ।")
                         st.code("\n".join(alog) or "कोई स्रोत नहीं चला", language=None)
 
                 ckey = f"cands_{P['id']}_{sel}"
@@ -2830,7 +5961,7 @@ elif page == "🎞️ एडिटर":
                         found, log = collect_photos(
                             q, P["folder"], f"{sel}_{int(time.time()) % 100000}",
                             eff_pixabay(), S["use_web"], P.get("modern", False) or bool(tl_sel),
-                            n=6, timelimit=tl_sel,
+                            n=6, timelimit=tl_sel, rules=rules_for(P, tl_sel),
                         )
                     st.session_state[ckey] = (q, found, log)
                 if ckey in st.session_state:
@@ -3105,7 +6236,7 @@ elif page == "🎞️ एडिटर":
                             src_ = "आपकी तस्वीर"
                         else:
                             imgp = os.path.join(P["folder"], f"new_{int(time.time() * 1000) % 10**9}.jpg")
-                            make_fallback_image(imgp, P["size"], [], None, title=P.get("anchor", ""))
+                            make_fallback_image(imgp, P["size"])
                             src_ = "खाली (नई फोटो लगाएँ)"
                         with st.spinner("दृश्य बन रहा है..."):
                             ns_ = new_scene(P, add_text, imgp, source=src_)
