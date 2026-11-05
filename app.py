@@ -1,4 +1,10 @@
-import streamlit as st
+# --- RAVI-BOOST-LOADER-BEGIN ---
+try:
+    import ravi_patches as _rb
+    _rb.run(globals().get("__file__"))
+except ImportError:
+    pass
+# --- RAVI-BOOST-LOADER-END ---import streamlit as st
 import requests
 import subprocess
 import tempfile
