@@ -1,3 +1,4 @@
+
 # -*- coding: utf-8 -*-
 """
 Ravi Boost - आपके Ravi Studio ऐप में बिना उसका कोड बदले सुधार जोड़ने वाली फ़ाइल।
@@ -282,6 +283,67 @@ def boost_lenient(queries, save_path, px_key, web_on, anchor, used, log):
     return None, None
 
 
+_SUBJ_CACHE = {}
+_NAME_SKIP = {"The", "This", "That", "These", "Those", "It", "He", "She", "They", "His", "Her",
+              "In", "On", "At", "And", "But", "When", "After", "Before", "While", "Then",
+              "There", "Here", "What", "Who", "How", "Why", "Today", "Yesterday", "One", "Two",
+              "Three", "A", "An", "Of", "To", "For", "With", "From", "By", "As", "If", "So",
+              "We", "You", "I", "Our", "Their", "Its", "Was", "Were", "Is", "Are"}
+
+
+def boost_entities(text):
+    """अंग्रेज़ी वाक्य से नाम निकालता है (खिलाड़ी, टीम, जगह): बड़े अक्षर से शुरू होने वाले शब्द।"""
+    found = []
+    for m in re.finditer(r"[A-Z][\w'\-\.]*(?:\s+[A-Z][\w'\-\.]*)*", text or ""):
+        toks = [t for t in re.findall(r"[A-Za-z]+", m.group(0)) if t not in _NAME_SKIP]
+        name = " ".join(toks).strip()
+        if len(name) >= 3 and name.lower() not in STOPWORDS:
+            found.append(name)
+    uniq = sorted(set(found), key=lambda x: (-len(x.split()), -len(x)))
+    return uniq[:4]
+
+
+def boost_subject_photo(names, save_path, px_key, web_on, used, log, tl, modern):
+    """नाम (जैसे खिलाड़ी/टीम) से ढेर सारी फोटो जुटाकर हर बार एक नई, अलग फोटो लेता है।"""
+    done = set()
+    for name in names[:3]:
+        key = name.lower()
+        if key in done:
+            continue
+        done.add(key)
+        ck = (key, tl, bool(px_key), bool(web_on))
+        cands = _SUBJ_CACHE.get(ck)
+        if cands is None:
+            cands, seen = [], set()
+            fetchers = [("Wikimedia", lambda e, n_=name: wikimedia_urls(n_, e)),
+                        ("Openverse", lambda e, n_=name: openverse_urls(n_, e))]
+            if px_key:
+                fetchers.append(("Pixabay", lambda e, n_=name: pixabay_urls(n_, px_key, e)))
+            if web_on:
+                fetchers.append(("Bing फोटो", lambda e, n_=name: bing_image_urls(n_, e)))
+                fetchers.append(("इंटरनेट", lambda e, n_=name: web_urls(n_, e)))
+            counts = []
+            for label, fn in fetchers:
+                try:
+                    got = fn([])
+                except Exception:
+                    got = []
+                counts.append(f"{label} {len(got)}")
+                for url, text in got:
+                    if url and url not in seen:
+                        seen.add(url)
+                        cands.append((url, text or ""))
+            _SUBJ_CACHE[ck] = cands
+            log.append(f"विषय-खोज '{name}': " + ", ".join(counts))
+        toks = {t.lower() for t in re.findall(r"[A-Za-z]{3,}", name)}
+        pref = [(u, t) for u, t in cands if u not in used and score_text(t, toks) >= 1]
+        ok = try_download(pref, save_path, used, set(), max_tries=8, modern=modern)
+        log.append(f"विषय-खोज '{name}': {len(pref)} नई फोटो उपलब्ध" + (" ✅ ली गई" if ok else ""))
+        if ok:
+            return f"विषय की फोटो: {name}", name
+    return None, None
+
+
 def smart_photo(queries, save_path, folder, tag, px_key, web_on, anchor,
                 modern, tl, gem, scene_en, topic, exclude, log, used, n=5):
     blob = " ".join(list(queries or [])) + " " + (anchor or "") + " " + (scene_en or "")
@@ -300,11 +362,26 @@ def smart_photo(queries, save_path, folder, tag, px_key, web_on, anchor,
     except Exception as e:
         log.append(f"खोज में समस्या: {str(e)[:80]}")
     try:
-        src, q = boost_lenient(queries, save_path, px_key, web_on, anchor, used, log)
+        names = boost_entities(scene_en) + ([anchor] if anchor else []) + boost_entities(topic)
+        names = [n_ for i_, n_ in enumerate(names) if n_ and n_ not in names[:i_]]
+        src, q = boost_subject_photo(names, save_path, px_key, web_on, used, log, tl, modern)
         if src:
             return src, q
     except Exception as e:
-        log.append(f"नरम खोज में समस्या: {str(e)[:80]}")
+        log.append(f"विषय-खोज में समस्या: {str(e)[:80]}")
+    try:
+        lenient_on = bool(S.get("lenient", False))
+    except Exception:
+        lenient_on = False
+    if lenient_on:
+        try:
+            src, q = boost_lenient(queries, save_path, px_key, web_on, anchor, used, log)
+            if src:
+                return src, q
+        except Exception as e:
+            log.append(f"नरम खोज में समस्या: {str(e)[:80]}")
+    else:
+        log.append("मेल खाती फोटो नहीं मिली (नरम खोज बंद है, इसलिए ग़लत फोटो नहीं लगाई)")
     try:
         hit = boost_library_photo(blob + " " + (topic or ""), save_path, used, log, allow_reuse=True)
         if hit:
@@ -505,6 +582,11 @@ def boost_settings_ui():
     S["karaoke"] = st.checkbox(
         "🌟 कैप्शन में बोले जा रहे शब्द पीले होते जाएँ",
         value=S.get("karaoke", True), key="s_karaoke",
+    )
+    S["lenient"] = st.checkbox(
+        "🔎 नरम खोज: मेल खाती फोटो न मिले तो कम सटीक (मिलती-जुलती) फोटो भी लगाएँ "
+        "(बंद रखें तो बेमेल फोटो नहीं लगेगी; नाम-आधारित विषय-खोज तब भी चलती है)",
+        value=S.get("lenient", False), key="s_lenient",
     )
     if eff_pixabay():
         st.caption("✅ Pixabay key मिल गई (अच्छी और साफ़ फोटो इसी से मिलती हैं)।")
