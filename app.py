@@ -1204,59 +1204,79 @@ def gemini_vision_pick(key, models, topic, scene_en, query, paths, fresh_hint,
     return 0, str(data.get("reason", ""))[:80]
 
 
+def _text_pick(found, need=3):
+    """AI जाँच न हो सके तो: शीर्षक में सबसे ज़्यादा शब्द मिलने वाली तस्वीर (नंबर 1..N), भरोसा न हो तो 0।"""
+    best, best_sc = 0, 0
+    for k, f_ in enumerate(found, 1):
+        sc_ = CAND_INFO.get(f_[0], 0)
+        if sc_ > best_sc:
+            best, best_sc = k, sc_
+    return best if best_sc >= need else 0
+
+
 def smart_photo(queries, save_path, folder, tag, px_key, web_on, anchor,
                 modern, tl, gem, scene_en, topic, exclude, log, used, n=6,
-                must_show="", avoid=""):
-    """कई विकल्प जुटाकर Gemini को दिखाता है; सिर्फ़ वही तस्वीर लेता है जो सचमुच मेल खाए।"""
+                must_show="", avoid="", beat=None):
+    """कई विकल्प जुटाकर Gemini को दिखाता है; सिर्फ़ वही तस्वीर लेता है जो सचमुच मेल खाए।
+    Gemini बार-बार जवाब न दे (जैसे 429 व्यस्त) तो उसे बंद कर शीर्षक-मेल के सख़्त नियम पर चलता है।"""
     lims = widen(tl)
     if gem and tl:
         lims = lims + [""]  # ताज़ा न मिले तो किसी भी समय की, पर AI जाँच के साथ
     attempts = 0
     for q in queries[:2]:
         for lim in lims:
-            if attempts >= 6:
+            if attempts >= 5:
                 return None, None
             attempts += 1
+            if beat:
+                beat()
             found, clog = collect_photos(
                 q, folder, f"{tag}_{attempts}", px_key, web_on, modern or bool(lim),
                 n=n, timelimit=lim, exclude=exclude, used=used,
             )
             log.extend(f"'{q}' [{lim or 'कोई भी समय'}] {l}" for l in clog)
+            if beat:
+                beat()
             if not found:
                 continue
 
             pick = 1
-            if gem:
-                paths_ = [f_[0] for f_ in found]
-                args_ = (gem["key"], gem["models"], topic, scene_en, q, paths_,
-                         bool(lim) or modern)
-                pick, reason = gemini_vision_pick(*args_, must_show=must_show, avoid=avoid)
+            verified = False
+            if gem and not gem.get("off"):
+                pick, reason = gemini_vision_pick(
+                    gem["key"], gem["models"], topic, scene_en, q,
+                    [f_[0] for f_ in found], bool(lim) or modern,
+                    must_show=must_show, avoid=avoid,
+                )
+                if beat:
+                    beat()
                 if pick is None:
-                    time.sleep(8)  # एक बार फिर कोशिश (अक्सर 429 व्यस्त होने की वजह से)
-                    pick, reason = gemini_vision_pick(*args_, must_show=must_show, avoid=avoid)
-                if pick is None:
-                    # जाँच नहीं हो सकी: बिना जाँच सिर्फ़ तब लें जब शीर्षक में कई शब्द मिले हों
-                    ranked = sorted(range(len(found)),
-                                    key=lambda k_: -CAND_INFO.get(found[k_][0], 0))
-                    top = ranked[0]
-                    if CAND_INFO.get(found[top][0], 0) >= 3:
-                        pick = top + 1
-                        log.append(f"⚠️ AI जाँच नहीं हो सकी ({reason}); शीर्षक सबसे ज़्यादा मिलने वाली तस्वीर ली")
-                    else:
-                        log.append(f"⚠️ AI जाँच नहीं हो सकी ({reason}); भरोसे लायक मेल नहीं, इसलिए नहीं ली")
-                        pick = 0
+                    gem["fails"] = gem.get("fails", 0) + 1
+                    if gem["fails"] >= 2:
+                        gem["off"] = True
+                        log.append("⚠️ Gemini जवाब नहीं दे रहा, आगे की तस्वीरें शीर्षक-मेल के सख़्त नियम से चुनेंगे")
+                    pick = _text_pick(found)
+                    log.append(f"⚠️ AI जाँच नहीं हो सकी ({reason}); "
+                               + ("शीर्षक सबसे ज़्यादा मिलने वाली तस्वीर ली" if pick
+                                  else "भरोसे लायक मेल नहीं, इसलिए नहीं ली"))
                 elif pick == 0:
+                    gem["fails"] = 0
                     log.append(f"🧐 AI जाँच ने सब तस्वीरें नकारीं: {reason}")
                 else:
+                    gem["fails"] = 0
+                    verified = True
                     log.append(f"🧐 AI जाँच ने तस्वीर {pick} चुनी: {reason}")
+            elif gem:  # Gemini बंद हो चुका
+                pick = _text_pick(found)
+                log.append("शीर्षक-मेल से चुनी" if pick else "भरोसे लायक मेल नहीं, इसलिए नहीं ली")
 
-                if pick == 0:
-                    for f_ in found:
-                        try:
-                            os.remove(f_[0])
-                        except Exception:
-                            pass
-                    continue
+            if pick == 0:
+                for f_ in found:
+                    try:
+                        os.remove(f_[0])
+                    except Exception:
+                        pass
+                continue
 
             path_, src_, url_ = found[pick - 1]
             shutil.copy(path_, save_path)
@@ -1266,7 +1286,7 @@ def smart_photo(queries, save_path, folder, tag, px_key, web_on, anchor,
                     os.remove(f_[0])
                 except Exception:
                     pass
-            return src_ + (" ✔ AI जाँच" if gem else ""), q
+            return src_ + (" ✔ AI जाँच" if verified else ""), q
     return None, None
 
 
@@ -1916,6 +1936,9 @@ def draft_job(P, cfg):
                 continue
             todo.append(i)
 
+        def beat():
+            set_state(P)  # हलचल दर्ज करता है और 'रोकें' दबाने पर काम रोकता है
+
         def search_scene(i):
             sc = scenes[i]
             path = os.path.join(folder, f"scene_{i}_0.jpg")
@@ -1940,8 +1963,10 @@ def draft_job(P, cfg):
             source, query = smart_photo(
                 queries, path, folder, f"s{i}", cfg["pixabay_key"], cfg["use_web"],
                 anchor, modern, tl, gem, english or sc["text"], topic,
-                exclude, log, used, must_show=must_show, avoid=avoid,
+                exclude, log, used, must_show=must_show, avoid=avoid, beat=beat,
             )
+            if source:
+                sc.update(image=path, source=source, query=query, log=log)
             return {"i": i, "path": path, "source": source, "query": query,
                     "log": log, "plan": plan, "english": english,
                     "exclude": exclude, "must_show": must_show, "avoid": avoid}
@@ -1956,6 +1981,7 @@ def draft_job(P, cfg):
                         r = fut.result()
                         found[r["i"]] = r
                         done_n += 1
+                        save_project(P)
                         set_state(
                             P, f"तस्वीरें खोज रहे हैं: {done_n}/{len(todo)}",
                             27 + done_n / len(todo) * 45,
@@ -1997,7 +2023,7 @@ def draft_job(P, cfg):
                     [anchor], path, folder, f"r{i}", cfg["pixabay_key"], cfg["use_web"],
                     anchor, modern, tl, gem, english or sc["text"], topic,
                     exclude, log, used,
-                    must_show=r.get("must_show", ""), avoid=r.get("avoid", ""),
+                    must_show=r.get("must_show", ""), avoid=r.get("avoid", ""), beat=beat,
                 )
 
             if source:
@@ -2454,9 +2480,9 @@ def is_busy(p):
     return p["state"] in ("drafting", "rendering")
 
 
-# अटका हुआ काम पहचानें (15 मिनट से कोई हलचल नहीं)
+# अटका हुआ काम पहचानें (30 मिनट से कोई हलचल नहीं)
 for _p in JOBS.values():
-    if is_busy(_p) and time.time() - _p.get("heartbeat", _p.get("created", time.time())) > 900:
+    if is_busy(_p) and time.time() - _p.get("heartbeat", _p.get("created", time.time())) > 1800:
         _p["state"] = "error"
         _p["error"] = "काम बहुत देर से अटका हुआ था, इसलिए रोक दिया गया।"
 
