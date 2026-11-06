@@ -1,10 +1,3 @@
-# --- RAVI-BOOST-LOADER-BEGIN ---
-try:
-    import ravi_patches as _rb
-    _rb.run(globals().get("__file__"))
-except ImportError:
-    pass
-# --- RAVI-BOOST-LOADER-END ---
 import streamlit as st
 import requests
 import subprocess
@@ -1214,7 +1207,7 @@ def _text_pick(found, need=3):
     return best if best_sc >= need else 0
 
 
-def smart_photo(queries, save_path, folder, tag, px_key, web_on, anchor,
+def pick_best_photo(queries, save_path, folder, tag, px_key, web_on, anchor,
                 modern, tl, gem, scene_en, topic, exclude, log, used, n=6,
                 must_show="", avoid="", beat=None):
     """कई विकल्प जुटाकर Gemini को दिखाता है; सिर्फ़ वही तस्वीर लेता है जो सचमुच मेल खाए।
@@ -1960,7 +1953,7 @@ def draft_job(P, cfg):
             exclude = sorted(set(e.lower() for e in exclude if e) | set(auto_ex))
             if not english:
                 english = translate_hi_en(sc["text"])
-            source, query = smart_photo(
+            source, query = pick_best_photo(
                 queries, path, folder, f"s{i}", cfg["pixabay_key"], cfg["use_web"],
                 anchor, modern, tl, gem, english or sc["text"], topic,
                 exclude, log, used, must_show=must_show, avoid=avoid, beat=beat,
@@ -2019,7 +2012,7 @@ def draft_job(P, cfg):
             if not source and anchor and gem:
                 # सामान्य तस्वीर भी तभी लेंगे जब Gemini जाँचकर कहे कि वह विषय से मेल खाती है
                 set_state(P, f"विषय से जुड़ी सामान्य तस्वीर खोज रहे हैं: दृश्य {i + 1}")
-                source, query = smart_photo(
+                source, query = pick_best_photo(
                     [anchor], path, folder, f"r{i}", cfg["pixabay_key"], cfg["use_web"],
                     anchor, modern, tl, gem, english or sc["text"], topic,
                     exclude, log, used,
@@ -2965,7 +2958,7 @@ elif page == "🎞️ एडिटर":
                         " ".join([P.get("script", ""), P.get("topic", ""), P.get("anchor", "")])
                     )
                     with st.spinner("ताज़ा फोटो खोजकर जाँच रहे हैं..."):
-                        src_, q_used = smart_photo(
+                        src_, q_used = pick_best_photo(
                             [qq], newp, P["folder"], f"m{sel}", eff_pixabay(), S["use_web"],
                             "", P.get("modern", False) or bool(tl_sel), tl_sel, gem, english,
                             P.get("topic", ""), auto_ex_ui, alog, set(),
@@ -3523,3 +3516,4 @@ else:
 if busy_any:
     time.sleep(3)
     st.rerun()
+
