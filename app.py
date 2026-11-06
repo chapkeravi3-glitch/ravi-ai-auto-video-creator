@@ -1,3 +1,16 @@
+import traceback
+import streamlit as st
+if True:
+    # शुरू में कोई भी गड़बड़ हो तो एरर स्क्रीन पर ही दिख जाए (लॉग खोलने की ज़रूरत नहीं)
+    try:
+        _src = open(__file__, encoding="utf-8").read()
+        _head, _body = _src.split("#=====RAVI-BODY=====\n", 1)
+        exec(compile("\n" * (_head.count("\n") + 1) + _body, __file__, "exec"), globals())
+    except Exception:
+        st.error("ऐप शुरू होते समय एरर आया। नीचे का पूरा टेक्स्ट भेज दें:")
+        st.code(traceback.format_exc())
+    st.stop()
+#=====RAVI-BODY=====
 import streamlit as st
 import requests
 import subprocess
@@ -3516,4 +3529,3 @@ else:
 if busy_any:
     time.sleep(3)
     st.rerun()
-
