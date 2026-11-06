@@ -102,7 +102,7 @@ PAD = 0.35     # दृश्य के अंत में ठहराव
 TRANS = 0.5    # दृश्यों के बीच ट्रांज़िशन की अवधि
 GEMINI_MODELS = ["gemini-3.5-flash", "gemini-3.5-flash-lite", "gemini-3-flash-preview"]
 HEADERS = {"User-Agent": "RaviAIVideoCreator/6.0 (personal video project)"}
-APP_VERSION = "Ravi Studio • संस्करण 9.1 (सही फोटो चुनने वाला सुधार)"
+APP_VERSION = "Ravi Studio • संस्करण 9.2 (मुख्य फोटो वाला तरीका)"
 
 CAPTION_SIZES = {"छोटा": 0.050, "मध्यम": 0.066, "बड़ा": 0.082}
 
@@ -291,6 +291,7 @@ def plan_with_ai(scenes, opening, key, on_progress=None):
     """हर दृश्य के लिए तस्वीर की खोज और AI prompt, मुफ़्त Gemini से।"""
     anchor = ""
     era = ""
+    pool = []
     plans = [None] * len(scenes)
     last_error = ""
     CH = 15
@@ -335,8 +336,13 @@ def plan_with_ai(scenes, opening, key, on_progress=None):
             "English words (for a match story include the sport, format, teams and year), "
             'and "era": "modern" if the story is about events after 2012, '
             'otherwise "historical".\n'
+            'Also return "pool": a list of 4 to 8 English image-search queries for the KEY '
+            "visuals of the whole story: one query for each named main person, team, event or "
+            'object (for example "Virat Kohli India cricket", "Glenn Phillips New Zealand '
+            'cricket", "John Cena WWE", "India vs New Zealand ODI stadium"). Each query must be '
+            "specific and contain the full name.\n"
             "Respond with ONLY JSON, no markdown: "
-            '{"anchor":"...","era":"modern","scenes":[{"n":1,"query":"...",'
+            '{"anchor":"...","era":"modern","pool":["..."],"scenes":[{"n":1,"query":"...",'
             '"must_show":"...","avoid":"...","ai":"...","exclude":["..."]}]}'
         )
 
@@ -358,6 +364,10 @@ def plan_with_ai(scenes, opening, key, on_progress=None):
 
         anchor = anchor or str(data.get("anchor", "")).strip()
         era = era or str(data.get("era", "")).strip().lower()
+        for pq in data.get("pool") or []:
+            pq = str(pq).strip()
+            if pq and pq.lower() not in [x.lower() for x in pool]:
+                pool.append(pq)
         for item in data.get("scenes", []):
             try:
                 n = int(item.get("n")) - 1
@@ -366,7 +376,7 @@ def plan_with_ai(scenes, opening, key, on_progress=None):
             if 0 <= n < len(scenes):
                 plans[n] = item
 
-    return anchor, plans, last_error, era
+    return anchor, plans, last_error, era, pool[:8]
 
 
 def llm_query(scene, topic):
@@ -1029,6 +1039,7 @@ def diagnose_services(pixabay_key="", gemini_key=""):
 
 
 CAND_INFO = {}  # विकल्प-फ़ाइल -> शीर्षक में मिले शब्दों की गिनती
+CAND_TEXT = {}  # विकल्प-फ़ाइल -> उस वेब-पन्ने का शीर्षक/विवरण
 
 
 def collect_photos(query, folder, tag, key, web_on, modern, n=6,
@@ -1041,6 +1052,7 @@ def collect_photos(query, folder, tag, key, web_on, modern, n=6,
     used = used if used is not None else set()
 
     found, seen, log = [], set(), []
+    texts_ = {}
     for name, fetch in make_sources(query, key, web_on, tl):
         if len(found) >= n:
             break
@@ -1058,6 +1070,7 @@ def collect_photos(query, folder, tag, key, web_on, modern, n=6,
             sc = score_text(text, words) if words else 1
             if sc >= need_sc:
                 scored.append((sc, url))
+                texts_[url] = text or ""
         scored.sort(key=lambda x: -x[0])
         log.append(
             f"{name}: {len(cands)} मिलीं, {len(scored)} मेल खाईं"
@@ -1083,6 +1096,7 @@ def collect_photos(query, folder, tag, key, web_on, modern, n=6,
                 path = os.path.join(folder, f"cand_{tag}_{len(found)}.jpg")
                 rgb.save(path, "JPEG", quality=88)
                 CAND_INFO[path] = sc_
+                CAND_TEXT[path] = texts_.get(url, "")
                 found.append((path, name, url))
             except Exception:
                 continue
@@ -1296,7 +1310,164 @@ def pick_best_photo(queries, save_path, folder, tag, px_key, web_on, anchor,
     return None, None
 
 
+def gemini_vision_pool(key, models, topic, query, paths, titles, fresh_hint):
+    """हर तस्वीर के लिए: ठीक है या नहीं + एक छोटा अंग्रेज़ी विवरण। जाँच न हो सके तो None।"""
+    prompt = (
+        "You are a strict photo editor for a Hindi video. We need REAL photographs of: "
+        f"{query}\n"
+        f"Video topic: {topic[:250]}\n"
+        f"Today's date: {time.strftime('%Y-%m-%d')}\n"
+        "Each photo comes with the title of the web page it was found on. Trust the title for "
+        "who the people are (never try to identify anyone from their face).\n"
+        "For EACH photo set ok=true only if the title matches the subject above AND the picture "
+        "is a clear, good-quality photograph that fits it (right sport, right match format, "
+        "right team kit). Set ok=false for collages, memes, screenshots, graphics with big text, "
+        "logos, and heavily watermarked images. "
+        + ("This is about recent events, so also set ok=false for old, black-and-white or "
+           "archival photos. " if fresh_hint else "")
+        + "Also give desc: one short English sentence saying what the photo shows (who, doing what).\n"
+        'Reply ONLY JSON: {"photos":[{"n":1,"ok":true,"desc":"..."}]}'
+    )
+    parts = [{"text": prompt}]
+    for i, (p, t) in enumerate(zip(paths, titles), 1):
+        try:
+            with Image.open(p) as im:
+                im = to_rgb(im)
+                im.thumbnail((512, 512))
+                buf = io.BytesIO()
+                im.save(buf, "JPEG", quality=72)
+            parts.append({"text": f"Photo {i} (page title: {t[:140]}):"})
+            parts.append({"inline_data": {
+                "mime_type": "image/jpeg",
+                "data": base64.b64encode(buf.getvalue()).decode(),
+            }})
+        except Exception:
+            return None
 
+    with _GEM_LOCK:
+        wait = 4.0 - (time.time() - _GEM_GATE["t"])
+        if wait > 0:
+            time.sleep(wait)
+        text, err = gemini_generate_parts(key, parts, models)
+        _GEM_GATE["t"] = time.time()
+    data = parse_json(text) if text else None
+    if not data or not isinstance(data.get("photos"), list):
+        return None
+    return data["photos"]
+
+
+def build_photo_pool(queries, folder, px_key, web_on, gem, tl, exclude, used, topic,
+                     modern, per_query=2, max_total=12, beat=None, log=None):
+    """कहानी के हर मुख्य व्यक्ति/घटना की 1-2 जाँची हुई असली फोटो जुटाता है।
+    लौटाता है [{"path", "label", "query"}]।"""
+    pool = []
+    for k, q in enumerate(queries[:8]):
+        if len(pool) >= max_total:
+            break
+        got = []
+        for lim in widen(tl) + [""]:
+            if beat:
+                beat()
+            found, clog = collect_photos(
+                q, folder, f"pool{k}{lim or 'x'}", px_key, web_on, modern or bool(lim),
+                n=6, timelimit=lim, exclude=exclude, used=used,
+            )
+            if log is not None:
+                log.extend(f"'{q}' [{lim or 'कोई भी समय'}] {l}" for l in clog)
+            if not found:
+                continue
+
+            accepted, res = [], None
+            if gem and not gem.get("off"):
+                res = gemini_vision_pool(
+                    gem["key"], gem["models"], topic, q, [f_[0] for f_ in found],
+                    [CAND_TEXT.get(f_[0], "") for f_ in found], bool(lim) or modern,
+                )
+                if beat:
+                    beat()
+                if res is None:
+                    gem["fails"] = gem.get("fails", 0) + 1
+                    if gem["fails"] >= 2:
+                        gem["off"] = True
+                else:
+                    gem["fails"] = 0
+                    for item in res:
+                        try:
+                            n_ = int(item.get("n"))
+                        except Exception:
+                            continue
+                        if item.get("ok") is True and 1 <= n_ <= len(found):
+                            accepted.append((n_ - 1, str(item.get("desc") or q)[:140]))
+            if res is None:
+                top = _text_pick(found, need=2)  # AI जाँच न हो सके तो शीर्षक-मेल
+                if top:
+                    accepted = [(top - 1, q)]
+            accepted = accepted[:per_query]
+            if log is not None:
+                log.append(f"🧐 '{q}': {len(accepted)} फोटो चुनी")
+
+            for j, (fi, desc) in enumerate(accepted):
+                path_, src_, url_ = found[fi]
+                newp = os.path.join(folder, f"pool_{k}_{j}.jpg")
+                shutil.copy(path_, newp)
+                used.add(url_)
+                got.append({"path": newp, "label": desc, "query": q})
+            for f_ in found:
+                try:
+                    os.remove(f_[0])
+                except Exception:
+                    pass
+            if got:
+                break
+        pool.extend(got)
+    return pool[:max_total]
+
+
+def assign_pool(scene_texts, pool, topic, key, models):
+    """Gemini से हर दृश्य के लिए समूह की सबसे सही फोटो का क्रम-संख्या (0 से) चुनवाता है।"""
+    n = len(scene_texts)
+    res = [-1] * n
+    desc = "\n".join(f"{i + 1}. {p['label'][:140]}" for i, p in enumerate(pool))
+    for start in range(0, n, 20):
+        chunk = scene_texts[start:start + 20]
+        numbered = "\n".join(f"{start + j + 1}. {s[:240]}" for j, s in enumerate(chunk))
+        prompt = (
+            "You are the photo editor of a Hindi video. Below is a pool of REAL photographs "
+            "(English descriptions) and the numbered narration scenes (Hindi).\n"
+            f"Video topic: {topic[:250]}\n\n"
+            f"Photo pool:\n{desc}\n\nScenes:\n{numbered}\n\n"
+            "For EACH scene choose the one photo that best fits what the scene is about. If the "
+            "scene names a person, team or event, use the photo of them. For jokes, dialogue or "
+            "reactions, use the photo of the main person being talked about. For general scenes, "
+            "use a stadium, crowd or general photo if the pool has one. The same photo may be "
+            "used for several scenes, but avoid using it for more than two scenes in a row.\n"
+            'Reply ONLY JSON: {"assign":[{"n":1,"photo":3}]}'
+        )
+        text, _err = gemini_generate(key, prompt, models)
+        data = parse_json(text) if text else None
+        for item in (data or {}).get("assign", []) or []:
+            try:
+                sn = int(item.get("n")) - 1
+                ph = int(item.get("photo")) - 1
+            except Exception:
+                continue
+            if 0 <= sn < n and 0 <= ph < len(pool):
+                res[sn] = ph
+        time.sleep(1)
+
+    # खाली बचे दृश्य भरें और एक ही फोटो को तीन बार लगातार आने से रोकें
+    use = [0] * len(pool)
+    prev, run = -1, 0
+    for i in range(n):
+        cur = res[i]
+        if cur == -1 or (cur == prev and run >= 2 and len(pool) > 1):
+            order = sorted(range(len(pool)), key=lambda x: (use[x], x))
+            cur = next((x for x in order if x != prev), order[0])
+        run = run + 1 if cur == prev else 1
+        res[i] = cur
+        use[cur] += 1
+        prev = cur
+    return res
 # ---------------------------------------------------------------- आवाज़
 def voice_params(text, speed_pct, natural):
     """हर दृश्य के लिए थोड़ा अलग गति और सुर, ताकि आवाज़ मशीनी न लगे।"""
@@ -1605,7 +1776,7 @@ def make_clip(image, prev, prev_effect, audio, voice_len, cues, out, size,
     w, h = size
     total = LEAD + voice_len + pad
     frames = max(1, math.ceil(total * FPS))
-    k = 1.5 if max(w, h) <= 1300 else 1.3
+    k = 1.5 if max(w, h) <= 1300 else 1.15  # बड़ी क्वालिटी में कम ज़ूम-जगह, ताकि मेमोरी कम लगे
     bw, bh = int(w * k) // 2 * 2, int(h * k) // 2 * 2
 
     if video:
@@ -1617,7 +1788,8 @@ def make_clip(image, prev, prev_effect, audio, voice_len, cues, out, size,
             f"[c0]fps={FPS},setsar=1,format=yuv420p[cur]",
         ]
     else:
-        cmd = [ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-i", image]
+        cmd = [ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
+               "-filter_threads", "1", "-filter_complex_threads", "1", "-i", image]
         graph = [
             compose("0:v", "0", bw, bh),
             f"[c0]{motion_filter(effect, frames, w, h)},"
@@ -1673,7 +1845,7 @@ def make_clip(image, prev, prev_effect, audio, voice_len, cues, out, size,
         f"adelay={int(LEAD * 1000)}|{int(LEAD * 1000)},apad=pad_dur={pad}",
         "-t", f"{total:.3f}",
         "-r", str(FPS),
-        "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-threads", "2",
         "-pix_fmt", "yuv420p",
         "-c:a", "aac", "-b:a", "160k", "-ar", "44100", "-ac", "2",
         out,
@@ -1889,8 +2061,9 @@ def draft_job(P, cfg):
             anchor = extra
             plans = [None] * n
             era = ""
+            pool_q = []
             if cfg["gemini_key"]:
-                g_anchor, plans, err, era = plan_with_ai(
+                g_anchor, plans, err, era, pool_q = plan_with_ai(
                     texts, P["script"], cfg["gemini_key"]
                 )
                 if not any(plans):
@@ -1909,7 +2082,7 @@ def draft_job(P, cfg):
             fresh_code = cfg.get("fresh", "auto")
             tl = ("m" if modern else "") if fresh_code == "auto" else fresh_code
             P.update(anchor=anchor, topic=topic, modern=modern or bool(tl),
-                     plans=plans, planned=True, timelimit=tl)
+                     plans=plans, planned=True, timelimit=tl, pool_queries=pool_q)
             save_project(P)
 
         anchor, topic, modern = P["anchor"], P["topic"], P["modern"]
@@ -1929,6 +2102,43 @@ def draft_job(P, cfg):
         used = P["used"]
         uploads = cfg["uploads"]
         lib = P.setdefault("library", [])
+
+        # ख़बर/मैच/वायरल कहानी: हर दृश्य की अलग फोटो खोजने की जगह, कहानी के मुख्य लोगों और घटनाओं की
+        # जाँची हुई असली फोटो का छोटा समूह जुटाकर दृश्यों में बाँटते हैं (नकली AI-चेहरे नहीं)
+        if cfg.get("pool_mode") and gem and modern and P.get("pool_queries") and not P.get("pooled"):
+            try:
+                set_state(P, "कहानी के मुख्य लोगों और घटनाओं की असली फोटो जुटा रहे हैं...", 28)
+                plog = []
+                pool = build_photo_pool(
+                    P["pool_queries"], folder, cfg["pixabay_key"], cfg["use_web"], gem, tl,
+                    auto_ex, used, topic, modern, beat=lambda: set_state(P), log=plog,
+                )
+                P["pool_log"] = plog
+                if len(pool) >= 2:
+                    set_state(P, "हर दृश्य के लिए सबसे सही फोटो चुन रहे हैं...", 60)
+                    pick_idx = assign_pool(
+                        [s_["text"] for s_ in scenes], pool, topic,
+                        cfg["gemini_key"], gem["models"],
+                    )
+                    for i, sc in enumerate(scenes):
+                        if (sc.get("image") and os.path.exists(sc["image"])) or i < len(uploads):
+                            continue
+                        pp = pool[pick_idx[i]]
+                        path = os.path.join(folder, f"scene_{i}_0.jpg")
+                        shutil.copy(pp["path"], path)
+                        sc.update(image=path, source="मुख्य फोटो", query=pp["label"][:80],
+                                  log=["मुख्य फोटो-समूह से: " + pp["label"][:100]])
+                    for pp in pool:
+                        lib.append({"path": pp["path"], "label": "मुख्य: " + pp["label"][:40]})
+                    P["pooled"] = True
+                else:
+                    P["note"] = (P.get("note", "") +
+                                 " मुख्य फोटो कम मिलीं, इसलिए हर दृश्य की अलग खोज की गई।").strip()
+                save_project(P)
+            except Exception as e:
+                if P.get("cancel"):
+                    raise
+                P["note"] = (P.get("note", "") + f" मुख्य फोटो का तरीका नहीं चला ({str(e)[:80]})।").strip()
 
         todo = []
         for i, sc in enumerate(scenes):
@@ -2172,7 +2382,9 @@ def render_job(P, cfg):
             os.replace(tmp, j["clip"])
 
         if pending:
-            workers = 2 if (os.cpu_count() or 2) <= 2 else min(4, (os.cpu_count() or 4) // 2)
+            # एक साथ कम क्लिप बनाएँ: Streamlit Cloud की मेमोरी कम है और ज़्यादा होने पर ऐप गिर जाता है
+            big = max(size) > 1300
+            workers = 1 if big else 2
             msg = f"{reused} क्लिप पहले से बने मिले, " if reused else ""
             done_n = 0
             set_state(P, f"{msg}{len(pending)} क्लिप बन रहे हैं...", 2)
@@ -2397,8 +2609,8 @@ NEW_FRESH = {"🤖 अपने आप (विषय देखकर)": "auto", 
 
 DEFAULTS = {
     "script": "", "voice_name": list(VOICES.keys())[0], "speed": -5, "natural": True,
-    "format_name": list(FORMATS.keys())[0], "quality": QUALITIES[0], "max_chars": 110,
-    "use_web": True, "use_ai": True, "extra_topic": "",
+    "format_name": list(FORMATS.keys())[0], "quality": QUALITIES[1], "max_chars": 110,
+    "use_web": True, "use_ai": False, "pool_mode": True, "extra_topic": "",
     "fresh_name": "🤖 अपने आप (विषय देखकर)", "verify": True,
     "captions_on": True, "cap_name": "मध्यम",
     "effect_choice": "Auto (हर दृश्य में अलग)", "transition_choice": "Auto (हर दृश्य अलग)",
@@ -2574,6 +2786,7 @@ def make_cfg(resume=False, uploads=None):
         "gemini_key": eff_gemini(), "pixabay_key": eff_pixabay(),
         "extra_topic": S["extra_topic"], "uploads": uploads or [],
         "fresh": NEW_FRESH.get(S["fresh_name"], "auto"), "verify": S["verify"],
+        "pool_mode": S.get("pool_mode", True),
         "render": render_cfg(),
     }
 
@@ -2691,8 +2904,13 @@ elif page == "✍️ नया":
         "🌐 इंटरनेट की तस्वीरों में खोजें (कॉपीराइट आपकी ज़िम्मेदारी है)",
         value=S["use_web"], key="w_web",
     )
+    S["pool_mode"] = st.checkbox(
+        "📌 मुख्य लोगों/घटनाओं की असली फोटो चुनकर दृश्यों में बाँटें "
+        "(ख़बर, मैच, वायरल कहानी के लिए सबसे अच्छा)", value=S["pool_mode"], key="w_pool",
+    )
     S["use_ai"] = st.checkbox(
-        "🤖 मेल खाती तस्वीर न मिले तो AI से बनाएँ", value=S["use_ai"], key="w_ai"
+        "🤖 फोटो न मिले तो AI से बनाएँ (असली लोगों की जगह नकली चेहरे बन सकते हैं)",
+        value=S["use_ai"], key="w_ai",
     )
     fresh_keys = list(NEW_FRESH.keys())
     S["fresh_name"] = st.selectbox(
