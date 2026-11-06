@@ -4,7 +4,8 @@ try:
     _rb.run(globals().get("__file__"))
 except ImportError:
     pass
-# --- RAVI-BOOST-LOADER-END ---import streamlit as st
+# --- RAVI-BOOST-LOADER-END ---
+import streamlit as st
 import requests
 import subprocess
 import tempfile
@@ -95,7 +96,7 @@ PAD = 0.35     # दृश्य के अंत में ठहराव
 TRANS = 0.5    # दृश्यों के बीच ट्रांज़िशन की अवधि
 GEMINI_MODELS = ["gemini-3.5-flash", "gemini-3.5-flash-lite", "gemini-3-flash-preview"]
 HEADERS = {"User-Agent": "RaviAIVideoCreator/6.0 (personal video project)"}
-APP_VERSION = "Ravi Studio • संस्करण 9"
+APP_VERSION = "Ravi Studio • संस्करण 9.1 (सही फोटो चुनने वाला सुधार)"
 
 CAPTION_SIZES = {"छोटा": 0.050, "मध्यम": 0.066, "बड़ा": 0.082}
 
@@ -298,27 +299,39 @@ def plan_with_ai(scenes, opening, key, on_progress=None):
             f"{start + j + 1}. {s[:300]}" for j, s in enumerate(chunk)
         )
         prompt = (
-            "You choose real photographs for a Hindi documentary-style video.\n"
+            "You are the photo editor of a Hindi video channel. You choose REAL "
+            "photographs that match each scene exactly. A wrong photo (wrong sport, "
+            "wrong match format, wrong team, wrong person, wrong era) ruins the video.\n"
+            f"Today's date: {time.strftime('%Y-%m-%d')}\n"
             f"Story opening (Hindi): {opening[:700]}\n\n"
             "Scenes (Hindi), numbered:\n"
             f"{numbered}\n\n"
+            "First decide the story type: recent news / sports / entertainment "
+            "(events after 2012), or a historical / science / general story.\n"
             "For EACH scene return:\n"
-            '- "query": an English image-search query of 2 to 5 words for a REAL '
-            "photograph, museum object, ruin, map or painting that visually matches "
-            "what is being said. Always include the specific subject name "
-            "(place, person, object) - never only generic words.\n"
+            '- "query": an English image-search query of 3 to 7 words for a REAL '
+            "photograph. Be as specific as a news photo editor. If the story is about "
+            "a match or news, include the sport, the match format (ODI, Test, T20, IPL), "
+            "the team names, the player name mentioned, the tournament and the year. "
+            "If it is historical, include the exact place, person or object name. "
+            "Never use only generic words such as 'cricket' or 'match'.\n"
+            '- "must_show": one short English phrase for what the photo MUST clearly '
+            'show (for example "India men\'s cricket team in blue one-day jersey").\n'
+            '- "avoid": one short English phrase for what it must NOT show (for example '
+            '"Test-match white kit, hockey, football, old black-and-white photos").\n'
             '- "ai": a detailed English prompt (one sentence) describing the '
             "visual, to generate an image if no photo is found. No text in the "
             "image, no real living people.\n"
-            '- "exclude": a list of 0 to 4 English words that must NOT appear in '
-            'the photo title (for example "test" when the story is about one-day '
-            "matches, or wrong teams).\n"
-            'Also return "anchor": the one or two word main subject of the whole story, '
+            '- "exclude": a list of 0 to 5 single English words that must NOT appear in '
+            "the photo title (wrong sports, wrong match formats, wrong teams). Never "
+            "include a word that could also appear in a correct title.\n"
+            'Also return "anchor": the main subject of the whole story in 2 to 4 '
+            "English words (for a match story include the sport, format, teams and year), "
             'and "era": "modern" if the story is about events after 2012, '
             'otherwise "historical".\n'
             "Respond with ONLY JSON, no markdown: "
             '{"anchor":"...","era":"modern","scenes":[{"n":1,"query":"...",'
-            '"ai":"...","exclude":["..."]}]}'
+            '"must_show":"...","avoid":"...","ai":"...","exclude":["..."]}]}'
         )
 
         data = None
@@ -453,6 +466,57 @@ def match_words(query, anchor):
 def score_text(text, words):
     t = (text or "").lower()
     return sum(1 for w in words if w in t)
+
+
+def _has_word(text, word):
+    """पूरा शब्द मिले तभी सही ('test' शब्द 'latest' में नहीं गिना जाएगा)।"""
+    w = (word or "").strip().lower()
+    if not w:
+        return False
+    return re.search(r"(?<![a-z0-9])" + re.escape(w) + r"(?![a-z0-9])", text or "") is not None
+
+
+_OTHER_SPORTS = {
+    "hockey": (["hockey", "हॉकी"], ["hockey"]),
+    "football": (["football", "soccer", "fifa", "फुटबॉल"], ["football", "soccer"]),
+    "tennis": (["tennis", "wimbledon", "टेनिस"], ["tennis"]),
+    "kabaddi": (["kabaddi", "कबड्डी"], ["kabaddi"]),
+    "badminton": (["badminton", "बैडमिंटन"], ["badminton"]),
+    "basketball": (["basketball", "nba", "बास्केटबॉल"], ["basketball", "nba"]),
+    "wrestling": (["wwe", "wrestling", "कुश्ती"], ["wwe", "wrestling"]),
+}
+_CRICKET_WORDS = [
+    "cricket", "odi", "t20", "ipl", "bcci", "क्रिकेट", "वनडे", "आईपीएल", "टी20", "टी-20",
+]
+
+
+def auto_excludes(blob):
+    """कहानी से खेल/फ़ॉर्मेट पहचानकर बेमेल शब्दों की सूची (जैसे वनडे में 'test', क्रिकेट में 'hockey')."""
+    b = (blob or "").lower()
+    found = set()
+    if any(k in b for k in _CRICKET_WORDS):
+        found.add("cricket")
+    for name, (keys, _) in _OTHER_SPORTS.items():
+        if any(k in b for k in keys):
+            found.add(name)
+    if len(found) != 1:
+        return []  # एक से ज़्यादा खेल हों तो अंदाज़ा नहीं लगाते
+
+    sport = next(iter(found))
+    ex = []
+    for name, (_, words) in _OTHER_SPORTS.items():
+        if name != sport:
+            ex.extend(words)
+
+    if sport == "cricket":
+        odi = any(k in b for k in ("odi", "वनडे", "एकदिवसीय", "one day", "one-day"))
+        test = any(k in b for k in ("test match", "test cricket", "टेस्ट"))
+        t20 = any(k in b for k in ("t20", "ipl", "टी20", "टी-20", "आईपीएल"))
+        if (odi or t20) and not test:
+            ex.append("test")
+        if test and not (odi or t20):
+            ex.extend(["odi", "t20", "ipl"])
+    return sorted(set(ex))
 
 
 # ---------------------------------------------------------------- तस्वीर के स्रोत
@@ -659,7 +723,7 @@ def try_download(cands, save_path, used, words, max_tries=8,
         if not url or url in used:
             continue
         t = (text or "").lower()
-        if any(e in t for e in ex):
+        if any(_has_word(t, e) for e in ex):
             continue
         if modern and OLD_YEAR.search(t):
             continue
@@ -958,11 +1022,15 @@ def diagnose_services(pixabay_key="", gemini_key=""):
     return rows
 
 
+CAND_INFO = {}  # विकल्प-फ़ाइल -> शीर्षक में मिले शब्दों की गिनती
+
+
 def collect_photos(query, folder, tag, key, web_on, modern, n=6,
                    timelimit=None, exclude=(), used=None):
     """कई विकल्प लौटाता है [(फ़ाइल, स्रोत, url)] और लॉग।"""
     tl = timelimit if timelimit is not None else ("y" if modern else "")
     words = match_words(query, "")
+    need_sc = 2 if len(words) >= 3 else 1
     ex = [e.lower() for e in exclude if e]
     used = used if used is not None else set()
 
@@ -977,12 +1045,12 @@ def collect_photos(query, folder, tag, key, web_on, modern, n=6,
             if not url or url in seen or url in used:
                 continue
             t = (text or "").lower()
-            if any(e in t for e in ex):
+            if any(_has_word(t, e) for e in ex):
                 continue
             if (modern or tl) and OLD_YEAR.search(t):
                 continue
             sc = score_text(text, words) if words else 1
-            if sc >= 1:
+            if sc >= need_sc:
                 scored.append((sc, url))
         scored.sort(key=lambda x: -x[0])
         log.append(
@@ -991,7 +1059,7 @@ def collect_photos(query, folder, tag, key, web_on, modern, n=6,
         )
 
         tries = 0
-        for _, url in scored:
+        for sc_, url in scored:
             if len(found) >= n or tries >= 10:
                 break
             tries += 1
@@ -1008,6 +1076,7 @@ def collect_photos(query, folder, tag, key, web_on, modern, n=6,
                 rgb.thumbnail((2000, 2000))
                 path = os.path.join(folder, f"cand_{tag}_{len(found)}.jpg")
                 rgb.save(path, "JPEG", quality=88)
+                CAND_INFO[path] = sc_
                 found.append((path, name, url))
             except Exception:
                 continue
@@ -1017,6 +1086,7 @@ def collect_photos(query, folder, tag, key, web_on, modern, n=6,
 # ---------------------------------------------------------------- Gemini से तस्वीर की जाँच
 _GEM_LOCK = threading.Lock()
 _GEM_GATE = {"t": 0.0}
+MIN_PHOTO_SCORE = 6  # Gemini के 10 में से इससे कम नंबर वाली तस्वीर नहीं ली जाती
 
 
 def gemini_generate_parts(key, parts, models):
@@ -1056,24 +1126,33 @@ def gemini_generate_parts(key, parts, models):
     return "", " | ".join(errors)[:400]
 
 
-def gemini_vision_pick(key, models, topic, scene_en, query, paths, fresh_hint):
-    """Gemini तस्वीरें देखकर सबसे सही चुनता है।
+def gemini_vision_pick(key, models, topic, scene_en, query, paths, fresh_hint,
+                       must_show="", avoid=""):
+    """Gemini हर तस्वीर को 0-10 नंबर देता है; सबसे ऊँचा नंबर MIN_PHOTO_SCORE से कम हो तो सब नकारता है।
     लौटाता है (नंबर 1..N, कारण); 0 = कोई ठीक नहीं; None = जाँच नहीं हो सकी।"""
     prompt = (
-        "You are a strict photo editor for a Hindi video.\n"
-        f"Video topic: {topic[:200]}\n"
-        f"Scene narration (meaning in English): {scene_en[:400]}\n"
-        f"Search query used: {query}\n"
+        "You are a very strict photo editor for a Hindi video. A wrong photo ruins "
+        "the video, so be harsh.\n"
+        f"Today's date: {time.strftime('%Y-%m-%d')}\n"
+        f"Video topic: {topic[:250]}\n"
+        f"Scene narration (English): {scene_en[:400]}\n"
+        + (f"The photo MUST clearly show: {must_show[:200]}\n" if must_show else "")
+        + (f"Reject photos showing: {avoid[:200]}\n" if avoid else "")
+        + f"Search query used: {query}\n"
         f"There are {len(paths)} candidate photos, numbered 1 to {len(paths)}.\n"
-        "Choose the ONE photo that best illustrates this scene. Rules: it must clearly "
-        "show the subject/event described, or a very closely related real scene. "
-        + ("The video is about a recent event, so the photo must look modern and recent "
-           "(modern kits, cameras, stadiums, clothing); reject old or black-and-white photos, "
-           "and photos of a different sport format, team or era. "
+        "Give EACH photo a score from 0 to 10:\n"
+        "- 0 to 3: wrong subject; wrong sport; wrong match format (for example white "
+        "Test-match kits for a one-day match, or hockey/football for a cricket story); "
+        "wrong team or wrong person; a person from another era; unrelated; mostly text; "
+        "logo; screenshot; collage; watermark; very low quality.\n"
+        "- 4 to 6: loosely related but not the actual subject.\n"
+        "- 7 to 10: clearly shows the subject or event described.\n"
+        + ("This is about recent events, so the photo must look modern (current team kits, "
+           "modern cameras and stadiums). Old, black-and-white or archival photos, and "
+           "retired or historical players, score 0 to 3 unless the narration is about them.\n"
            if fresh_hint else "")
-        + "Reject photos that are unrelated, mostly text, logos, screenshots, collages, "
-        "watermarked or very low quality. If none is acceptable return 0.\n"
-        'Reply ONLY JSON: {"best": <number 0..N>, "reason": "<max 12 words>"}'
+        + 'Reply ONLY JSON: {"scores":[{"n":1,"score":0,"issue":"max 8 words"}],'
+        '"best":<number 1..N, or 0 if no photo scores 6 or more>}'
     )
     parts = [{"text": prompt}]
     for i, p in enumerate(paths, 1):
@@ -1101,23 +1180,41 @@ def gemini_vision_pick(key, models, topic, scene_en, query, paths, fresh_hint):
     data = parse_json(text) if text else None
     if not data:
         return None, err or "जवाब समझ नहीं आया"
+
+    scores, issues = {}, {}
+    for s_ in data.get("scores") or []:
+        try:
+            k = int(s_.get("n"))
+            scores[k] = float(s_.get("score"))
+            issues[k] = str(s_.get("issue", ""))[:60]
+        except Exception:
+            continue
+    if scores:
+        best_n, best_sc = max(scores.items(), key=lambda kv: kv[1])
+        if 1 <= best_n <= len(paths) and best_sc >= MIN_PHOTO_SCORE:
+            return best_n, f"{int(best_sc)}/10 - {issues.get(best_n, '')}"
+        return 0, f"सबसे अच्छी को भी सिर्फ़ {int(best_sc)}/10 मिला ({issues.get(best_n, '')})"
+
     try:
         best = int(data.get("best", 0))
     except Exception:
         return None, "जवाब में नंबर नहीं था"
-    reason = str(data.get("reason", ""))[:80]
     if 1 <= best <= len(paths):
-        return best, reason
-    return 0, reason
+        return best, str(data.get("reason", ""))[:80]
+    return 0, str(data.get("reason", ""))[:80]
 
 
 def smart_photo(queries, save_path, folder, tag, px_key, web_on, anchor,
-                modern, tl, gem, scene_en, topic, exclude, log, used, n=5):
-    """कई विकल्प जुटाकर (और Gemini हो तो उसे दिखाकर) सबसे सही तस्वीर चुनता है।"""
+                modern, tl, gem, scene_en, topic, exclude, log, used, n=6,
+                must_show="", avoid=""):
+    """कई विकल्प जुटाकर Gemini को दिखाता है; सिर्फ़ वही तस्वीर लेता है जो सचमुच मेल खाए।"""
+    lims = widen(tl)
+    if gem and tl:
+        lims = lims + [""]  # ताज़ा न मिले तो किसी भी समय की, पर AI जाँच के साथ
     attempts = 0
     for q in queries[:2]:
-        for lim in widen(tl):
-            if attempts >= 4:
+        for lim in lims:
+            if attempts >= 6:
                 return None, None
             attempts += 1
             found, clog = collect_photos(
@@ -1130,23 +1227,36 @@ def smart_photo(queries, save_path, folder, tag, px_key, web_on, anchor,
 
             pick = 1
             if gem:
-                pick, reason = gemini_vision_pick(
-                    gem["key"], gem["models"], topic, scene_en, q,
-                    [f_[0] for f_ in found], bool(lim) or modern,
-                )
+                paths_ = [f_[0] for f_ in found]
+                args_ = (gem["key"], gem["models"], topic, scene_en, q, paths_,
+                         bool(lim) or modern)
+                pick, reason = gemini_vision_pick(*args_, must_show=must_show, avoid=avoid)
                 if pick is None:
-                    log.append(f"⚠️ AI जाँच नहीं हो सकी ({reason}); पहली मेल खाती तस्वीर ली")
-                    pick = 1
+                    time.sleep(8)  # एक बार फिर कोशिश (अक्सर 429 व्यस्त होने की वजह से)
+                    pick, reason = gemini_vision_pick(*args_, must_show=must_show, avoid=avoid)
+                if pick is None:
+                    # जाँच नहीं हो सकी: बिना जाँच सिर्फ़ तब लें जब शीर्षक में कई शब्द मिले हों
+                    ranked = sorted(range(len(found)),
+                                    key=lambda k_: -CAND_INFO.get(found[k_][0], 0))
+                    top = ranked[0]
+                    if CAND_INFO.get(found[top][0], 0) >= 3:
+                        pick = top + 1
+                        log.append(f"⚠️ AI जाँच नहीं हो सकी ({reason}); शीर्षक सबसे ज़्यादा मिलने वाली तस्वीर ली")
+                    else:
+                        log.append(f"⚠️ AI जाँच नहीं हो सकी ({reason}); भरोसे लायक मेल नहीं, इसलिए नहीं ली")
+                        pick = 0
                 elif pick == 0:
                     log.append(f"🧐 AI जाँच ने सब तस्वीरें नकारीं: {reason}")
+                else:
+                    log.append(f"🧐 AI जाँच ने तस्वीर {pick} चुनी: {reason}")
+
+                if pick == 0:
                     for f_ in found:
                         try:
                             os.remove(f_[0])
                         except Exception:
                             pass
                     continue
-                else:
-                    log.append(f"🧐 AI जाँच ने तस्वीर {pick} चुनी: {reason}")
 
             path_, src_, url_ = found[pick - 1]
             shutil.copy(path_, save_path)
@@ -1156,7 +1266,7 @@ def smart_photo(queries, save_path, folder, tag, px_key, web_on, anchor,
                     os.remove(f_[0])
                 except Exception:
                     pass
-            return src_ + (" ✔ AI जाँच" if gem and pick else ""), q
+            return src_ + (" ✔ AI जाँच" if gem else ""), q
     return None, None
 
 
@@ -1780,6 +1890,9 @@ def draft_job(P, cfg):
         tl = P.get("timelimit", "m" if modern else "")
         plans = P.get("plans") or [None] * n
 
+        # कहानी से खेल/फ़ॉर्मेट पहचानकर बेमेल शब्द (जैसे वनडे में 'test', क्रिकेट में 'hockey')
+        auto_ex = auto_excludes(" ".join([P["script"], topic, anchor, extra]))
+
         # Gemini से हर तस्वीर की जाँच (key हो और चालू हो तो)
         gem = None
         if cfg["gemini_key"] and cfg.get("verify", True):
@@ -1809,6 +1922,7 @@ def draft_job(P, cfg):
             log = []
             plan = plans[i] if i < len(plans) else None
             english, exclude = "", []
+            must_show, avoid = "", ""
             if plan and plan.get("query"):
                 q = str(plan["query"]).strip()
                 queries = [with_anchor(q, anchor)]
@@ -1816,18 +1930,21 @@ def draft_job(P, cfg):
                     queries.append(anchor)
                 ex = plan.get("exclude") or []
                 exclude = [str(e) for e in ex] if isinstance(ex, list) else []
+                must_show = str(plan.get("must_show") or "").strip()
+                avoid = str(plan.get("avoid") or "").strip()
             else:
                 queries, english = scene_queries(sc["text"], topic, anchor)
+            exclude = sorted(set(e.lower() for e in exclude if e) | set(auto_ex))
             if not english:
                 english = translate_hi_en(sc["text"])
             source, query = smart_photo(
                 queries, path, folder, f"s{i}", cfg["pixabay_key"], cfg["use_web"],
                 anchor, modern, tl, gem, english or sc["text"], topic,
-                exclude, log, used,
+                exclude, log, used, must_show=must_show, avoid=avoid,
             )
             return {"i": i, "path": path, "source": source, "query": query,
                     "log": log, "plan": plan, "english": english,
-                    "exclude": exclude}
+                    "exclude": exclude, "must_show": must_show, "avoid": avoid}
 
         found = {}
         if todo:
@@ -1873,12 +1990,14 @@ def draft_job(P, cfg):
                 elif not prompt:
                     ai_err.append("दृश्य का तस्वीर-विवरण नहीं बन सका")
 
-            if not source and anchor:
+            if not source and anchor and gem:
+                # सामान्य तस्वीर भी तभी लेंगे जब Gemini जाँचकर कहे कि वह विषय से मेल खाती है
                 set_state(P, f"विषय से जुड़ी सामान्य तस्वीर खोज रहे हैं: दृश्य {i + 1}")
-                source, query = find_photo(
-                    [anchor], path, used, cfg["pixabay_key"], cfg["use_web"],
-                    anchor, exclude=exclude, modern=modern, relaxed=True,
-                    log=log, timelimit=tl,
+                source, query = smart_photo(
+                    [anchor], path, folder, f"r{i}", cfg["pixabay_key"], cfg["use_web"],
+                    anchor, modern, tl, gem, english or sc["text"], topic,
+                    exclude, log, used,
+                    must_show=r.get("must_show", ""), avoid=r.get("avoid", ""),
                 )
 
             if source:
@@ -2816,11 +2935,14 @@ elif page == "🎞️ एडिटर":
                         gem = {"key": eff_gemini(), "models": g_models or GEMINI_MODELS}
                     newp = os.path.join(P["folder"], f"auto_{sel}_{int(time.time() * 1000) % 10**9}.jpg")
                     alog = []
+                    auto_ex_ui = auto_excludes(
+                        " ".join([P.get("script", ""), P.get("topic", ""), P.get("anchor", "")])
+                    )
                     with st.spinner("ताज़ा फोटो खोजकर जाँच रहे हैं..."):
                         src_, q_used = smart_photo(
                             [qq], newp, P["folder"], f"m{sel}", eff_pixabay(), S["use_web"],
                             "", P.get("modern", False) or bool(tl_sel), tl_sel, gem, english,
-                            P.get("topic", ""), [], alog, set(),
+                            P.get("topic", ""), auto_ex_ui, alog, set(),
                         )
                     if src_:
                         add_to_library(newp, f"{src_}: {qq[:30]}")
